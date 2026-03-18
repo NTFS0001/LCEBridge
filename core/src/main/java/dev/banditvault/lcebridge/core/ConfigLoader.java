@@ -9,7 +9,6 @@ import java.util.Map;
  */
 public class ConfigLoader {
 
-    @SuppressWarnings("unchecked")
     public static BridgeConfig load(File file) throws IOException {
         BridgeConfig cfg = new BridgeConfig();
         if (!file.exists()) return cfg;
@@ -42,6 +41,7 @@ public class ConfigLoader {
             cfg.chunkCacheSize          = integer(performance, "chunk-cache-size", cfg.chunkCacheSize);
             cfg.asyncCompression        = bool(performance, "async-compression", cfg.asyncCompression);
             cfg.liveTileUpdates         = bool(performance, "live-tile-updates", cfg.liveTileUpdates);
+            cfg.forwardChat             = bool(performance, "forward-chat", cfg.forwardChat);
 
             Map<String, Object> logging = section(root, "logging");
             cfg.logLevel            = str(logging, "level", cfg.logLevel);

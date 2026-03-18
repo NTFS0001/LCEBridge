@@ -67,6 +67,18 @@ public final class LceChunkBuilder {
         return out;
     }
 
+    public CachedLceChunkColumn snapshot(int chunkX, int chunkZ) {
+        return new CachedLceChunkColumn(
+            chunkX,
+            chunkZ,
+            blockIds.clone(),
+            blockData.clone(),
+            skyLight.clone(),
+            blockLight.clone(),
+            biomes.clone()
+        );
+    }
+
     private int packHalfHeightNibbles(byte[] src, byte[] dst, int dstPos) {
         dstPos = packHalf(src, dst, dstPos, 0);
         dstPos = packHalf(src, dst, dstPos, 128);

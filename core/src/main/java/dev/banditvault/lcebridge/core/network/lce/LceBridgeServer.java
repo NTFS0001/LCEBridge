@@ -29,6 +29,7 @@ public class LceBridgeServer {
         this.config = config;
     }
 
+    @SuppressWarnings("deprecation")
     public void start() throws InterruptedException {
         bossGroup   = new NioEventLoopGroup(1);
         workerGroup = new NioEventLoopGroup();

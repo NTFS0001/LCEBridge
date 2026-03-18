@@ -84,6 +84,8 @@ public class ChunkTranslator {
                     for (int ly = 0; ly < 256; ly++)
                         builder.setSkyLight(lx, ly, lz, 15);
 
+            session.cacheTranslatedChunk(cx, cz, builder.snapshot(cx, cz));
+
             byte[] raw  = builder.buildRawData();
             byte[] comp = RleZlibCompressor.compress(raw);
 

@@ -1,6 +1,8 @@
 package dev.banditvault.lcebridge.core.session;
 
 import dev.banditvault.lcebridge.core.BridgeConfig;
+import dev.banditvault.lcebridge.core.chunk.CachedLceChunkColumn;
+import dev.banditvault.lcebridge.core.chunk.RleZlibCompressor;
 import dev.banditvault.lcebridge.core.network.java.JavaSession;
 import dev.banditvault.lcebridge.core.network.lce.*;
 import dev.banditvault.lcebridge.core.registry.MappingRegistry;
@@ -10,7 +12,6 @@ import org.cloudburstmc.nbt.NbtType;
 import org.geysermc.mcprotocollib.network.packet.Packet;
 import org.geysermc.mcprotocollib.protocol.packet.common.clientbound.ClientboundDisconnectPacket;
 import org.geysermc.mcprotocollib.protocol.packet.common.clientbound.ClientboundKeepAlivePacket;
-import org.geysermc.mcprotocollib.protocol.packet.common.serverbound.ServerboundKeepAlivePacket;
 import org.geysermc.mcprotocollib.protocol.packet.configuration.clientbound.ClientboundRegistryDataPacket;
 import org.geysermc.mcprotocollib.protocol.data.game.ClientCommand;
 import org.geysermc.mcprotocollib.protocol.data.game.entity.player.Hand;
@@ -19,14 +20,12 @@ import org.geysermc.mcprotocollib.protocol.data.game.entity.player.PlayerSpawnIn
 import org.geysermc.mcprotocollib.protocol.data.game.inventory.ClickItemAction;
 import org.geysermc.mcprotocollib.protocol.data.game.inventory.ContainerAction;
 import org.geysermc.mcprotocollib.protocol.data.game.inventory.ContainerActionType;
-import org.geysermc.mcprotocollib.protocol.data.game.inventory.ContainerType;
 import org.geysermc.mcprotocollib.protocol.data.game.inventory.DropItemAction;
 import org.geysermc.mcprotocollib.protocol.data.game.inventory.ShiftClickItemAction;
 import org.geysermc.mcprotocollib.protocol.packet.ingame.clientbound.*;
 import org.geysermc.mcprotocollib.protocol.packet.ingame.clientbound.level.*;
 import org.geysermc.mcprotocollib.protocol.packet.ingame.clientbound.entity.player.*;
 import org.geysermc.mcprotocollib.protocol.packet.ingame.clientbound.inventory.*;
-import org.geysermc.mcprotocollib.protocol.data.game.level.notify.GameEvent;
 import org.geysermc.mcprotocollib.protocol.packet.ingame.serverbound.*;
 import org.geysermc.mcprotocollib.protocol.packet.ingame.serverbound.inventory.*;
 import org.geysermc.mcprotocollib.protocol.packet.ingame.serverbound.player.*;
@@ -68,6 +67,8 @@ public class LceBridgeSession {
     private static final int LCE_SMALL_ID         = 4; // Remote clients start at XUSER_MAX_COUNT (4) in Win64 WinsockNetLayer
     private static final int LCE_ENTITY_ID        = (LCE_SMALL_ID * 100) + 1; // = 401
     private static final long TILE_UPDATE_GRACE_MS = 2000L;
+    private static final org.geysermc.mcprotocollib.protocol.data.game.entity.object.Direction DEFAULT_DIG_FACE =
+        org.geysermc.mcprotocollib.protocol.data.game.entity.object.Direction.DOWN;
 
     private final BridgeConfig  config;
     private final Channel       lceChannel;
@@ -102,11 +103,12 @@ public class LceBridgeSession {
     private volatile int blockActionSequence  = 0;
     private volatile Integer activeDigSequence = null;
     private volatile org.cloudburstmc.math.vector.Vector3i activeDigPos = null;
-    private volatile org.geysermc.mcprotocollib.protocol.data.game.entity.object.Direction activeDigFace = org.geysermc.mcprotocollib.protocol.data.game.entity.object.Direction.DOWN;
+    private volatile org.geysermc.mcprotocollib.protocol.data.game.entity.object.Direction activeDigFace = DEFAULT_DIG_FACE;
     private volatile byte lastJavaAbilityFlags = 0;
     private volatile float lastJavaFlySpeed = 0.05f;
     private volatile float lastJavaWalkSpeed = 0.1f;
     private final Map<Integer, Integer> containerStateIds = new ConcurrentHashMap<>();
+    private final Map<Long, CachedLceChunkColumn> translatedChunkCache = new ConcurrentHashMap<>();
     private volatile int currentLevelIdx = 0;
 
     private String playerName = "Unknown";
@@ -255,7 +257,6 @@ public class LceBridgeSession {
         // as the player hovering in mid-air, causing a "flying" kick after ~15 seconds.
         // Once the LCE client is sending its own movement at 20 pps we don't need it.
         if (hasPosition && movedEnough && playerMoving.compareAndSet(false, true)) {
-            log.info("Player movement started — position heartbeat stopped");
             log.info("Player movement started - heartbeat switched to idle mode");
         }
         switch (p.id) {
@@ -281,8 +282,7 @@ public class LceBridgeSession {
         }
 
         var pos = org.cloudburstmc.math.vector.Vector3i.from(p.x, p.y, p.z);
-        var dirValues = org.geysermc.mcprotocollib.protocol.data.game.entity.object.Direction.values();
-        var face = dirValues[Math.max(0, Math.min(p.face, dirValues.length - 1))];
+        var face = directionFromFaceIndex(p.face);
         javaSession.send(new ServerboundUseItemOnPacket(
             pos, face, Hand.MAIN_HAND, p.clickX, p.clickY, p.clickZ, false, false, sequence
         ));
@@ -311,19 +311,22 @@ public class LceBridgeSession {
         };
         if (action == null) return;
         var rawPos = org.cloudburstmc.math.vector.Vector3i.from(p.x, p.y, p.z);
-        var rawDir = org.geysermc.mcprotocollib.protocol.data.game.entity.object.Direction.values()[
-            Math.max(0, Math.min(p.face, org.geysermc.mcprotocollib.protocol.data.game.entity.object.Direction.values().length - 1))];
+        var rawDir = directionFromFaceIndex(p.face);
         var pos = rawPos;
         var dir = rawDir;
         boolean blankDigPos = rawPos.getX() == 0 && rawPos.getY() == 0 && rawPos.getZ() == 0;
 
-        // LCE occasionally follows a valid START_DESTROY_BLOCK with ABORT/STOP at 0,0,0.
-        // Vanilla Java treats that as a mismatched dig target and rejects the break.
-        if ((p.action == 1 || p.action == 2) && activeDigPos != null && blankDigPos) {
+        // ABORT should stay tied to the original target. LCE can also emit a blank
+        // STOP target; keep that tied to the active dig target too.
+        boolean shouldPinToActiveTarget =
+            activeDigPos != null && (p.action == 1 || (p.action == 2 && blankDigPos));
+        if (shouldPinToActiveTarget) {
             pos = activeDigPos;
-            dir = activeDigFace;
-            log.info("Substituting active dig target for blank LCE action {} -> ({}, {}, {})",
-                p.action, pos.getX(), pos.getY(), pos.getZ());
+            dir = currentDigFace();
+            if (!activeDigPos.equals(rawPos) || blankDigPos) {
+                log.info("Pinning LCE dig action {} from ({}, {}, {}) to active target ({}, {}, {})",
+                    p.action, rawPos.getX(), rawPos.getY(), rawPos.getZ(), pos.getX(), pos.getY(), pos.getZ());
+            }
         }
 
         int seq;
@@ -338,12 +341,12 @@ public class LceBridgeSession {
             } else {
                 seq = ++blockActionSequence;
             }
-            // Keep the active dig target alive across blank ABORT packets; some LCE
-            // clients follow with a second blank FINISH packet for the same block.
-            if (p.action == 2 || !blankDigPos) {
+            // Keep the active dig target alive across ABORT packets; some LCE clients
+            // follow with a later FINISH for the same block.
+            if (p.action == 2) {
                 activeDigSequence = null;
                 activeDigPos = null;
-                activeDigFace = org.geysermc.mcprotocollib.protocol.data.game.entity.object.Direction.DOWN;
+                activeDigFace = DEFAULT_DIG_FACE;
             }
         } else {
             seq = ++blockActionSequence;
@@ -591,7 +594,7 @@ public class LceBridgeSession {
                 // PlayerLoaded once the ack goes out (see teleportAcked flag).
                 if (teleportAcked.get()) {
                     javaSession.send(ServerboundPlayerLoadedPacket.INSTANCE);
-                    javaSession.send(new ServerboundChunkBatchReceivedPacket(10.0f));
+                    javaSession.send(new ServerboundChunkBatchReceivedPacket(advertisedChunkRate()));
                     log.info("Sent PlayerLoaded + ChunkBatchReceived on LEVEL_CHUNKS_LOAD_START (teleport already acked)");
                 } else {
                     log.info("LEVEL_CHUNKS_LOAD_START received before teleport ack — deferring PlayerLoaded until ack");
@@ -645,18 +648,45 @@ public class LceBridgeSession {
     }
 
     private void onJavaBlockUpdate(ClientboundBlockUpdatePacket p) {
-        if (!canSendTileUpdates()) return;
         var entry = p.getEntry();
         if (entry == null || entry.getPosition() == null) return;
-        sendTileUpdate(entry.getPosition().getX(), entry.getPosition().getY(), entry.getPosition().getZ(), entry.getBlock());
+        int x = entry.getPosition().getX();
+        int y = entry.getPosition().getY();
+        int z = entry.getPosition().getZ();
+        if (canSendTileUpdates()) {
+            sendTileUpdate(x, y, z, entry.getBlock());
+            return;
+        }
+        CachedLceChunkColumn cached = updateCachedChunkBlock(x, y, z, entry.getBlock());
+        if (cached != null) {
+            resendCachedChunk(cached);
+        }
     }
 
     private void onJavaSectionBlocksUpdate(ClientboundSectionBlocksUpdatePacket p) {
-        if (!canSendTileUpdates() || p.getEntries() == null) return;
+        if (p.getEntries() == null) return;
+        if (canSendTileUpdates()) {
+            for (var entry : p.getEntries()) {
+                if (entry == null || entry.getPosition() == null) continue;
+                sendTileUpdate(entry.getPosition().getX(), entry.getPosition().getY(), entry.getPosition().getZ(), entry.getBlock());
+            }
+            return;
+        }
+        Map<Long, CachedLceChunkColumn> dirtyChunks = new HashMap<>();
         for (var entry : p.getEntries()) {
             if (entry == null || entry.getPosition() == null) continue;
-            // MCProtocolLib already expands section-local coordinates to global block positions.
-            sendTileUpdate(entry.getPosition().getX(), entry.getPosition().getY(), entry.getPosition().getZ(), entry.getBlock());
+            CachedLceChunkColumn cached = updateCachedChunkBlock(
+                entry.getPosition().getX(),
+                entry.getPosition().getY(),
+                entry.getPosition().getZ(),
+                entry.getBlock()
+            );
+            if (cached != null) {
+                dirtyChunks.put(chunkKey(cached.chunkX(), cached.chunkZ()), cached);
+            }
+        }
+        for (CachedLceChunkColumn cached : dirtyChunks.values()) {
+            resendCachedChunk(cached);
         }
     }
 
@@ -728,7 +758,7 @@ public class LceBridgeSession {
     }
 
     private void onJavaChunkBatchFinished(ClientboundChunkBatchFinishedPacket p) {
-        javaSession.send(new ServerboundChunkBatchReceivedPacket(10.0f));
+        javaSession.send(new ServerboundChunkBatchReceivedPacket(advertisedChunkRate()));
         javaChunkBatchFinished.set(true);
         log.info("Java chunk batch finished: queued={}, pending={}", queuedChunkCount, pendingChunks.size());
 
@@ -817,7 +847,7 @@ public class LceBridgeSession {
             // If LEVEL_CHUNKS_LOAD_START already fired, send PlayerLoaded now.
             if (chunkLoadStartMs > 0L) {
                 javaSession.send(ServerboundPlayerLoadedPacket.INSTANCE);
-                javaSession.send(new ServerboundChunkBatchReceivedPacket(10.0f));
+                javaSession.send(new ServerboundChunkBatchReceivedPacket(advertisedChunkRate()));
                 log.info("Deferred PlayerLoaded + ChunkBatchReceived sent after teleport ack");
             }
         }
@@ -840,7 +870,8 @@ public class LceBridgeSession {
         stopPositionHeartbeat();
         activeDigSequence = null;
         activeDigPos = null;
-        activeDigFace = org.geysermc.mcprotocollib.protocol.data.game.entity.object.Direction.DOWN;
+        activeDigFace = DEFAULT_DIG_FACE;
+        translatedChunkCache.clear();
         sendLce(buildRespawnPacket());
         SetHealthPacket sh = new SetHealthPacket();
         sh.health = 20.0f;
@@ -852,18 +883,29 @@ public class LceBridgeSession {
     }
 
     private void onJavaSystemChat(ClientboundSystemChatPacket p) {
+        if (!config.forwardChat) return;
         if (!spawnFinished.get()) return; // don't send chat before LCE client is in-world
+        String plain = componentToPlain(p.getContent()).trim();
+        if (plain.isEmpty()) return;
         ChatPacket lc = new ChatPacket();
-        lc.setMessage(componentToPlain(p.getContent()));
+        lc.setMessage(plain);
         sendLce(lc);
     }
 
     private void onJavaPlayerChat(ClientboundPlayerChatPacket p) {
+        if (!config.forwardChat) return;
         if (!spawnFinished.get()) return; // don't send chat before LCE client is in-world
         ChatPacket lc = new ChatPacket();
         net.kyori.adventure.text.Component body = p.getUnsignedContent() != null
             ? p.getUnsignedContent() : net.kyori.adventure.text.Component.text(p.getContent());
-        lc.setMessage("<" + p.getName() + "> " + componentToPlain(body));
+        String name = componentToPlain(p.getName()).trim();
+        String message = componentToPlain(body).trim();
+        if (message.isEmpty()) return;
+        if (name.isEmpty()) {
+            lc.setMessage(message);
+        } else {
+            lc.setMessage("<" + name + "> " + message);
+        }
         sendLce(lc);
     }
 
@@ -938,6 +980,9 @@ public class LceBridgeSession {
      * translatable components so players see something readable rather than class names.
      */
     private static String componentToPlain(net.kyori.adventure.text.Component c) {
+        if (c == null) {
+            return "";
+        }
         if (c instanceof net.kyori.adventure.text.TextComponent tc) {
             // Collect plain text from this node and its children recursively
             StringBuilder sb = new StringBuilder(tc.content());
@@ -947,11 +992,110 @@ public class LceBridgeSession {
             return sb.toString();
         }
         if (c instanceof net.kyori.adventure.text.TranslatableComponent tc) {
-            // Return the translation key as a fallback — better than the full object toString
-            return tc.key();
+            StringBuilder sb = new StringBuilder();
+            if (tc.fallback() != null && !tc.fallback().isBlank()) {
+                sb.append(tc.fallback());
+            } else {
+                sb.append(tc.key());
+            }
+            for (net.kyori.adventure.text.TranslationArgument arg : tc.arguments()) {
+                String plainArg = translationArgumentToPlain(arg);
+                if (!plainArg.isBlank()) {
+                    if (!sb.isEmpty()) sb.append(' ');
+                    sb.append(plainArg);
+                }
+            }
+            for (net.kyori.adventure.text.Component child : tc.children()) {
+                sb.append(componentToPlain(child));
+            }
+            return sb.toString();
         }
         // Any other component type: use toString but it may be noisy
         return c.toString();
+    }
+
+    private static String translationArgumentToPlain(net.kyori.adventure.text.TranslationArgument arg) {
+        if (arg == null) {
+            return "";
+        }
+        Object value = arg.value();
+        if (value instanceof net.kyori.adventure.text.ComponentLike componentLike) {
+            return componentToPlain(componentLike.asComponent());
+        }
+        return value == null ? "" : String.valueOf(value);
+    }
+
+    private float advertisedChunkRate() {
+        return (float) Math.max(1, config.chunksPerTick);
+    }
+
+    public void cacheTranslatedChunk(int chunkX, int chunkZ, CachedLceChunkColumn column) {
+        translatedChunkCache.put(chunkKey(chunkX, chunkZ), column);
+    }
+
+    private long chunkKey(int chunkX, int chunkZ) {
+        return (((long) chunkX) << 32) ^ (chunkZ & 0xffffffffL);
+    }
+
+    private CachedLceChunkColumn updateCachedChunkBlock(int x, int y, int z, int javaBlockState) {
+        if (y < 0 || y > 255) {
+            return null;
+        }
+        int chunkX = Math.floorDiv(x, 16);
+        int chunkZ = Math.floorDiv(z, 16);
+        CachedLceChunkColumn cached = translatedChunkCache.get(chunkKey(chunkX, chunkZ));
+        if (cached == null) {
+            return null;
+        }
+        int localX = Math.floorMod(x, 16);
+        int localZ = Math.floorMod(z, 16);
+        cached.setBlock(
+            localX,
+            y,
+            localZ,
+            MappingRegistry.blocks().getLceId(javaBlockState),
+            MappingRegistry.blocks().getLceData(javaBlockState)
+        );
+        return cached;
+    }
+
+    private void resendCachedChunk(CachedLceChunkColumn cached) {
+        try {
+            byte[] raw = cached.buildRawData();
+            byte[] comp = RleZlibCompressor.compress(raw);
+
+            ChunkVisibilityPacket vis = new ChunkVisibilityPacket();
+            vis.chunkX = cached.chunkX();
+            vis.chunkZ = cached.chunkZ();
+            vis.visible = true;
+            sendLce(vis);
+
+            BlockRegionUpdatePacket bru = new BlockRegionUpdatePacket();
+            bru.x = cached.chunkX() << 4;
+            bru.y = 0;
+            bru.z = cached.chunkZ() << 4;
+            bru.xs = 16;
+            bru.ys = 256;
+            bru.zs = 16;
+            bru.levelIdx = currentLevelIdx;
+            bru.isFullChunk = true;
+            bru.compressedData = comp;
+            sendLce(bru);
+        } catch (Exception e) {
+            log.warn("Failed to resend cached chunk ({}, {}) after block update", cached.chunkX(), cached.chunkZ(), e);
+        }
+    }
+
+    private org.geysermc.mcprotocollib.protocol.data.game.entity.object.Direction directionFromFaceIndex(int faceIndex) {
+        var dirValues = org.geysermc.mcprotocollib.protocol.data.game.entity.object.Direction.values();
+        int idx = Math.max(0, Math.min(faceIndex, dirValues.length - 1));
+        org.geysermc.mcprotocollib.protocol.data.game.entity.object.Direction face = dirValues[idx];
+        return face != null ? face : DEFAULT_DIG_FACE;
+    }
+
+    private org.geysermc.mcprotocollib.protocol.data.game.entity.object.Direction currentDigFace() {
+        org.geysermc.mcprotocollib.protocol.data.game.entity.object.Direction face = activeDigFace;
+        return face != null ? face : DEFAULT_DIG_FACE;
     }
 
     private void onJavaDisconnected() {
@@ -969,7 +1113,8 @@ public class LceBridgeSession {
         blockActionSequence = 0;
         activeDigSequence = null;
         activeDigPos = null;
-        activeDigFace = org.geysermc.mcprotocollib.protocol.data.game.entity.object.Direction.DOWN;
+        activeDigFace = DEFAULT_DIG_FACE;
+        translatedChunkCache.clear();
         sendLce(makeDisconnect(2));
         lceChannel.close();
     }
