@@ -4,7 +4,7 @@ plugins {
 
 allprojects {
     group = "dev.banditvault.lcebridge"
-    version = "0.2.0"
+    version = (findProperty("releaseVersion") as String?) ?: "0.3.0"
 
     repositories {
         mavenCentral()
