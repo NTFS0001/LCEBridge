@@ -42,13 +42,25 @@ public class LcePacketDecoder extends ByteToMessageDecoder {
 
         ByteBuf payload = in.readBytes(length);
         try {
-            int peekId = payload.getUnsignedByte(0);
-            log.debug("Decoder: reading packet id={} length={}", peekId, length);
-            LcePacket pkt = LcePacketReader.read(payload);
-            if (pkt != null) {
-                out.add(pkt);
-            } else {
-                log.debug("Decoder: packet id={} returned null from reader", peekId);
+            // Win64 LCE client batches multiple packets into a single length-prefixed frame.
+            // E.g. AnimatePacket(5 bytes) + InteractPacket(10 bytes) + MovePlayerPosRot(42 bytes)
+            // all within one frame. We must loop and decode each sub-packet until exhausted.
+            while (payload.readableBytes() > 0) {
+                int peekId = payload.getUnsignedByte(payload.readerIndex());
+                int before = payload.readableBytes();
+                log.debug("Decoder: reading packet id={} remaining={}", peekId, before);
+                LcePacket pkt = LcePacketReader.read(payload);
+                if (pkt != null) {
+                    out.add(pkt);
+                } else {
+                    log.debug("Decoder: packet id={} returned null from reader, skipping remaining {} bytes", peekId, payload.readableBytes());
+                    break;
+                }
+                // Safety: if the reader didn't consume any bytes, break to avoid infinite loop
+                if (payload.readableBytes() >= before) {
+                    log.warn("Decoder: packet id={} consumed 0 bytes, breaking to avoid loop", peekId);
+                    break;
+                }
             }
         } catch (Exception e) {
             log.warn("Error decoding LCE packet: {}", e.getMessage(), e);

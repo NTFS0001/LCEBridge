@@ -112,21 +112,10 @@ public class LcePacketReader {
     }
 
     private static InteractPacket readInteract(LceByteReader r) {
-        // Dump raw bytes for debugging — the payload is larger than expected (20 vs 10 bytes)
-        ByteBuf buf = r.buffer();
-        int readable = buf.readableBytes();
-        byte[] raw = new byte[readable];
-        buf.getBytes(buf.readerIndex(), raw);
-        StringBuilder sb = new StringBuilder("InteractPacket raw bytes (").append(readable).append("): ");
-        for (byte b : raw) sb.append(String.format("%02x ", b));
-        log.info(sb.toString().trim());
-
         InteractPacket p = new InteractPacket();
         p.source = r.readInt();
         p.target = r.readInt();
         p.action = r.readUnsignedByte();
-        log.info("InteractPacket parsed: source={} target={} action={} remainingBytes={}", 
-            p.source, p.target, p.action, buf.readableBytes());
         return p;
     }
 
@@ -141,27 +130,9 @@ public class LcePacketReader {
     }
 
     private static AnimatePacket readAnimate(LceByteReader r) {
-        ByteBuf buf = r.buffer();
-        int readable = buf.readableBytes();
-        byte[] raw = new byte[readable];
-        buf.getBytes(buf.readerIndex(), raw);
-        StringBuilder sb = new StringBuilder("AnimatePacket raw bytes (").append(readable).append("): ");
-        for (byte b : raw) sb.append(String.format("%02x ", b));
-        log.info(sb.toString().trim());
-
         AnimatePacket p = new AnimatePacket();
         p.entityId = r.readInt();
         p.action = r.readByte() & 0xFF;
-
-        // Win64 LCE AnimatePacket has extra data after the standard fields.
-        // Try reading a target entity ID if there's enough data remaining.
-        int remaining = r.readableBytes();
-        if (remaining >= 4) {
-            p.targetEntityId = r.readInt();
-        }
-
-        log.info("AnimatePacket parsed: entityId={} action={} targetEntityId={} remainingAfter={}",
-            p.entityId, p.action, p.targetEntityId, r.readableBytes());
         return p;
     }
 

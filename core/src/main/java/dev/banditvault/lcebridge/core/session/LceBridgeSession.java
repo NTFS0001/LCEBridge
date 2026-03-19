@@ -263,18 +263,12 @@ public class LceBridgeSession {
 
     private void handleAnimate(AnimatePacket p) {
         if (!javaSession.isConnected()) return;
-        // LCE action=1 is arm swing — Java requires this for attacks to register
+        // LCE action=1 is arm swing. Send to Java for animation visibility to other players.
+        // The ATTACK InteractPacket follows in the same batched frame and handles damage.
         if (p.action == 1) {
             ensureCarriedItemSynced();
             flushLatestPoseForAction();
             javaSession.send(new ServerboundSwingPacket(Hand.MAIN_HAND));
-
-            // Win64 LCE bundles target entity info in the AnimatePacket.
-            // If we have a valid target, send ATTACK.
-            if (p.targetEntityId > 0 && p.targetEntityId != LCE_ENTITY_ID) {
-                javaSession.send(new ServerboundInteractPacket(p.targetEntityId, InteractAction.ATTACK, false));
-                log.info("Forwarded LCE attack on entity {} from AnimatePacket", p.targetEntityId);
-            }
         }
         // Some LCE builds signal respawn via Animate action=4.
         if (p.action == 4) {
@@ -444,9 +438,13 @@ public class LceBridgeSession {
         if (p.action == 0) {
             javaSession.send(new ServerboundInteractPacket(p.target, InteractAction.INTERACT, Hand.MAIN_HAND, false));
         } else if (p.action == 1) {
-            // Java requires both swing and interact for damage to register
-            javaSession.send(new ServerboundSwingPacket(Hand.MAIN_HAND));
+            // ATTACK must be sent BEFORE SwingPacket. Player.swing() resets the
+            // attackStrengthTicker to 0 on the Java server. If swing goes first,
+            // the attack reads ticker=0 and deals 0 damage.
+            log.info("Forwarding LCE ATTACK: target={} source={} javaEntityId={} pose=({},{},{})",
+                p.target, p.source, javaEntityId, lastKnownX, lastKnownY, lastKnownZ);
             javaSession.send(new ServerboundInteractPacket(p.target, InteractAction.ATTACK, false));
+            javaSession.send(new ServerboundSwingPacket(Hand.MAIN_HAND));
         }
     }
 
