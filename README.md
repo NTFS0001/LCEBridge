@@ -7,52 +7,67 @@
 </p>
 
 <p align="center">
+  <img src="https://img.shields.io/badge/Version-0.2.0-2A9D8F?style=flat-square" alt="Version 0.2.0" />
   <img src="https://img.shields.io/badge/Java-21-ED8B00?style=flat-square&logo=openjdk" alt="Java 21" />
   <img src="https://img.shields.io/badge/Build-Gradle-02303A?style=flat-square&logo=gradle" alt="Gradle" />
   <img src="https://img.shields.io/badge/Network-Netty-333333?style=flat-square" alt="Netty" />
-  <img src="https://img.shields.io/badge/Status-Active%20Development-C89200?style=flat-square" alt="Status" />
 </p>
 
-LCEBridge is a Java 21 protocol translator that aims to let unmodified Minecraft Legacy Console Edition clients join Minecraft Java Edition servers.
+LCEBridge is a Java 21 protocol bridge that lets unmodified Minecraft Legacy Console Edition clients connect to Minecraft Java Edition servers.
 
 ```text
 LCE Client <-> LCEBridge <-> Java Server
 ```
 
-## Purpose
+## Overview
 
-The goal of the bridge is to translate between the native LCE protocol and modern Java protocol traffic while preserving gameplay behavior as closely as possible.
+The bridge translates between native LCE packets and modern Java Edition protocol traffic while preserving gameplay behavior as closely as possible. It is designed as a standalone runtime with protocol codecs, entity and inventory translation, world/chunk conversion, and mapping data generation all in one repository.
 
-## Current Focus
+## Current Capabilities
 
-- Login and session translation
-- World and chunk translation
+- LCE login and session handling
+- Java login and in-world join flow
+- Chunk translation and chunk streaming
 - Block and item mapping
-- Standalone bridge runtime
+- Multiplayer entity synchronization
+- Java-to-LCE chat and translated system message forwarding
 
 ## Repository Layout
 
 | Path | Purpose |
 |------|---------|
 | `core/` | Packet codecs, session logic, mappings, and translation code |
-| `bootstrap-standalone/` | Standalone entrypoint and runtime resources |
-| `tools/` | Scripts for generating and refreshing mapping data |
+| `bootstrap-standalone/` | Standalone runtime and application entrypoint |
+| `tools/` | Mapping generation and maintenance scripts |
+
+## Requirements
+
+- Java 21
+- Windows for the current local tooling and runtime workflow
 
 ## Build
+
+Build everything:
 
 ```powershell
 .\gradlew.bat build
 ```
 
-Build only the standalone bootstrap:
+Build the standalone runtime jar:
 
 ```powershell
-.\gradlew.bat :bootstrap-standalone:build
+.\gradlew.bat :bootstrap-standalone:shadowJar
+```
+
+The runnable artifact is written to:
+
+```text
+_build/bootstrap-standalone/libs/bootstrap-standalone-0.2.0.jar
 ```
 
 ## Status
 
-The bridge is in active development. Login and world join flow are progressing, but protocol coverage and gameplay translation are still incomplete.
+LCEBridge is usable for active multiplayer testing, but it is still under development. Protocol coverage, gameplay parity, and edge-case compatibility are ongoing work.
 
 ## Related Repositories
 
