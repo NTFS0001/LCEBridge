@@ -70,6 +70,7 @@ public class LceBridgeSession {
     private static final Logger log = LoggerFactory.getLogger(LceBridgeSession.class);
     private static final int LCE_NET_VERSION      = 560;
     private static final int LCE_PROTOCOL_VERSION = 78;
+    private static final int LCE_CHAT_MAX_CHARS   = 119;
     private static final long BRIDGE_HOST_XUID    = 1L;
     private static final int LCE_SMALL_ID         = 4; // Remote clients start at XUSER_MAX_COUNT (4) in Win64 WinsockNetLayer
     private static final int LCE_ENTITY_ID        = (LCE_SMALL_ID * 100) + 1; // = 401
@@ -1331,28 +1332,68 @@ public class LceBridgeSession {
     private void onJavaSystemChat(ClientboundSystemChatPacket p) {
         if (!config.forwardChat) return;
         if (!spawnFinished.get()) return; // don't send chat before LCE client is in-world
-        String plain = componentToPlain(p.getContent()).trim();
-        if (plain.isEmpty()) return;
-        ChatPacket lc = new ChatPacket();
-        lc.setMessage(plain);
-        sendLce(lc);
+        if (p.isOverlay()) return;
+        sendChatToLce(componentToPlain(p.getContent()));
     }
 
     private void onJavaPlayerChat(ClientboundPlayerChatPacket p) {
         if (!config.forwardChat) return;
         if (!spawnFinished.get()) return; // don't send chat before LCE client is in-world
-        ChatPacket lc = new ChatPacket();
         net.kyori.adventure.text.Component body = p.getUnsignedContent() != null
             ? p.getUnsignedContent() : net.kyori.adventure.text.Component.text(p.getContent());
         String name = componentToPlain(p.getName()).trim();
         String message = componentToPlain(body).trim();
         if (message.isEmpty()) return;
         if (name.isEmpty()) {
-            lc.setMessage(message);
+            sendChatToLce(message);
         } else {
-            lc.setMessage("<" + name + "> " + message);
+            sendChatToLce("<" + name + "> " + message);
         }
+    }
+
+    private void sendChatToLce(String rawText) {
+        String text = sanitizeLceChat(rawText);
+        if (text.isEmpty()) return;
+
+        ChatPacket lc = new ChatPacket();
+        lc.setMessage(text);
         sendLce(lc);
+    }
+
+    private String sanitizeLceChat(String rawText) {
+        if (rawText == null || rawText.isBlank()) {
+            return "";
+        }
+
+        StringBuilder normalized = new StringBuilder(rawText.length());
+        boolean lastWasSpace = true;
+        for (int i = 0; i < rawText.length();) {
+            int codePoint = rawText.codePointAt(i);
+            i += Character.charCount(codePoint);
+
+            if (Character.isISOControl(codePoint) || Character.isWhitespace(codePoint)) {
+                if (!lastWasSpace && normalized.length() > 0) {
+                    normalized.append(' ');
+                    lastWasSpace = true;
+                }
+                continue;
+            }
+
+            normalized.appendCodePoint(Character.isBmpCodePoint(codePoint) ? codePoint : '?');
+            lastWasSpace = false;
+        }
+
+        String text = normalized.toString().trim();
+        if (text.length() <= LCE_CHAT_MAX_CHARS) {
+            return text;
+        }
+
+        int truncatedLength = Math.max(0, LCE_CHAT_MAX_CHARS - 3);
+        String truncated = text.substring(0, truncatedLength).trim() + "...";
+        if (config.logPackets) {
+            log.debug("Truncated Java chat for LCE from {} to {} chars: {}", text.length(), truncated.length(), truncated);
+        }
+        return truncated;
     }
 
     private void onJavaPlayerInfoUpdate(ClientboundPlayerInfoUpdatePacket p) {
@@ -1610,16 +1651,11 @@ public class LceBridgeSession {
         if (c == null) {
             return "";
         }
+
+        StringBuilder sb = new StringBuilder();
         if (c instanceof net.kyori.adventure.text.TextComponent tc) {
-            // Collect plain text from this node and its children recursively
-            StringBuilder sb = new StringBuilder(tc.content());
-            for (net.kyori.adventure.text.Component child : tc.children()) {
-                sb.append(componentToPlain(child));
-            }
-            return sb.toString();
-        }
-        if (c instanceof net.kyori.adventure.text.TranslatableComponent tc) {
-            StringBuilder sb = new StringBuilder();
+            sb.append(tc.content());
+        } else if (c instanceof net.kyori.adventure.text.TranslatableComponent tc) {
             if (tc.fallback() != null && !tc.fallback().isBlank()) {
                 sb.append(tc.fallback());
             } else {
@@ -1628,17 +1664,32 @@ public class LceBridgeSession {
             for (net.kyori.adventure.text.TranslationArgument arg : tc.arguments()) {
                 String plainArg = translationArgumentToPlain(arg);
                 if (!plainArg.isBlank()) {
-                    if (!sb.isEmpty()) sb.append(' ');
+                    if (sb.length() > 0) {
+                        sb.append(' ');
+                    }
                     sb.append(plainArg);
                 }
             }
-            for (net.kyori.adventure.text.Component child : tc.children()) {
-                sb.append(componentToPlain(child));
+        } else if (c instanceof net.kyori.adventure.text.KeybindComponent kc) {
+            sb.append(kc.keybind());
+        } else if (c instanceof net.kyori.adventure.text.ScoreComponent sc) {
+            if (sc.value() != null && !sc.value().isBlank()) {
+                sb.append(sc.value());
+            } else {
+                sb.append(sc.name());
             }
-            return sb.toString();
+        } else if (c instanceof net.kyori.adventure.text.SelectorComponent sc) {
+            sb.append(sc.pattern());
+        } else if (c instanceof net.kyori.adventure.text.NBTComponent<?, ?> nc) {
+            sb.append(nc.nbtPath());
+        } else if (c instanceof net.kyori.adventure.text.ObjectComponent oc && oc.contents() != null) {
+            sb.append(String.valueOf(oc.contents()));
         }
-        // Any other component type: use toString but it may be noisy
-        return c.toString();
+
+        for (net.kyori.adventure.text.Component child : c.children()) {
+            sb.append(componentToPlain(child));
+        }
+        return sb.toString();
     }
 
     private static String translationArgumentToPlain(net.kyori.adventure.text.TranslationArgument arg) {
