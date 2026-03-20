@@ -31,7 +31,7 @@ public class BridgeConfig {
     public boolean chunkCacheEnabled       = true;
     public int     chunkCacheSize          = 256;
     public boolean asyncCompression        = true;
-    public boolean liveTileUpdates         = false;
+    public boolean liveTileUpdates         = true;
     public boolean forwardChat             = false;
 
     // Logging
