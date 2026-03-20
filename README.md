@@ -23,6 +23,12 @@ LCE Client <-> LCEBridge <-> Java Server
 
 The bridge translates between native LCE packets and modern Java Edition protocol traffic while preserving gameplay behavior as closely as possible. It is designed as a standalone runtime with protocol codecs, entity and inventory translation, world/chunk conversion, and mapping data generation all in one repository.
 
+## Workspace Fit
+
+- Use `LCEBridge` when the target server is Minecraft Java Edition rather than the native `LCEServer`
+- Pair it with `LCEClient` or `LCEDebug` for protocol and gameplay testing from a Windows client build
+- Use `LCELauncher` when you want managed bridge releases, Java route setup, and online-auth handoff
+
 ## Current Capabilities
 
 - LCE login and session handling
