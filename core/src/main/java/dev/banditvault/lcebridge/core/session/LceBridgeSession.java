@@ -173,6 +173,8 @@ public class LceBridgeSession {
     private volatile LceItemStack cachedCursorItem = null;
     private volatile org.cloudburstmc.math.vector.Vector3i activeDigPos = null;
     private volatile org.geysermc.mcprotocollib.protocol.data.game.entity.object.Direction activeDigFace = DEFAULT_DIG_FACE;
+    private volatile org.cloudburstmc.math.vector.Vector3i recentDigLogPos = null;
+    private volatile long recentDigLogUntilMs = 0L;
     private volatile byte lastJavaAbilityFlags = 0;
     private volatile float lastJavaFlySpeed = 0.05f;
     private volatile float lastJavaWalkSpeed = 0.1f;
@@ -520,6 +522,22 @@ public class LceBridgeSession {
             activeDigPos = pos;
             activeDigFace = dir;
         }
+        if (p.action == 0 || p.action == 1 || p.action == 2) {
+            rememberRecentDigLog(pos);
+            log.info(
+                "Forwarding LCE dig {} seq={} sent=({}, {}, {}) face={} raw=({}, {}, {}) rawFace={}",
+                describeDigAction(p.action),
+                seq,
+                pos.getX(),
+                pos.getY(),
+                pos.getZ(),
+                dir,
+                rawPos.getX(),
+                rawPos.getY(),
+                rawPos.getZ(),
+                p.face
+            );
+        }
         javaSession.send(new ServerboundPlayerActionPacket(action, pos, dir, seq));
         if (p.action == 3 || p.action == 4) {
             predictSelectedHotbarDrop(p.action == 3);
@@ -862,6 +880,9 @@ public class LceBridgeSession {
         int x = entry.getPosition().getX();
         int y = entry.getPosition().getY();
         int z = entry.getPosition().getZ();
+        if (shouldLogRecentDigUpdate(x, y, z)) {
+            log.info("Java block update for recent dig target at ({}, {}, {}) state={}", x, y, z, entry.getBlock());
+        }
         if (config.logPackets) {
             log.debug(
                 "Java block-update pos=({}, {}, {}) state={} canSendTileUpdates={}",
@@ -884,6 +905,19 @@ public class LceBridgeSession {
 
     private void onJavaSectionBlocksUpdate(ClientboundSectionBlocksUpdatePacket p) {
         if (p.getEntries() == null) return;
+        for (var entry : p.getEntries()) {
+            if (entry == null || entry.getPosition() == null) continue;
+            if (shouldLogRecentDigUpdate(entry.getPosition().getX(), entry.getPosition().getY(), entry.getPosition().getZ())) {
+                log.info(
+                    "Java section block update for recent dig target at ({}, {}, {}) state={}",
+                    entry.getPosition().getX(),
+                    entry.getPosition().getY(),
+                    entry.getPosition().getZ(),
+                    entry.getBlock()
+                );
+                break;
+            }
+        }
         if (config.logPackets) {
             log.debug(
                 "Java section-blocks-update entries={} canSendTileUpdates={}",
@@ -2680,6 +2714,30 @@ public class LceBridgeSession {
         return config.liveTileUpdates
             && postChunkReady.get()
             && System.currentTimeMillis() >= tileUpdatesReadyAtMs;
+    }
+
+    private void rememberRecentDigLog(org.cloudburstmc.math.vector.Vector3i pos) {
+        recentDigLogPos = pos;
+        recentDigLogUntilMs = System.currentTimeMillis() + 3000L;
+    }
+
+    private boolean shouldLogRecentDigUpdate(int x, int y, int z) {
+        var pos = recentDigLogPos;
+        if (pos == null) return false;
+        if (System.currentTimeMillis() > recentDigLogUntilMs) return false;
+        return pos.getX() == x && pos.getY() == y && pos.getZ() == z;
+    }
+
+    private String describeDigAction(int action) {
+        return switch (action) {
+            case 0 -> "START_DIGGING";
+            case 1 -> "CANCEL_DIGGING";
+            case 2 -> "FINISH_DIGGING";
+            case 3 -> "DROP_ITEM_STACK";
+            case 4 -> "DROP_ITEM";
+            case 5 -> "RELEASE_USE_ITEM";
+            default -> "UNKNOWN(" + action + ")";
+        };
     }
 
     // MovePlayerPosRot (id=13) for teleport
