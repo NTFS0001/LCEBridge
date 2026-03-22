@@ -136,6 +136,7 @@ public class LceBridgeSession {
     private final AtomicBoolean initialTeleportHandled = new AtomicBoolean(false);
     private final AtomicBoolean postChunkSpawnSent = new AtomicBoolean(false);
     private final AtomicBoolean postChunkReady = new AtomicBoolean(false);
+    private final AtomicBoolean warnedMovementBeforePostChunkReady = new AtomicBoolean(false);
     private final AtomicBoolean clientInformationSent = new AtomicBoolean(false);
     private final AtomicBoolean javaChunkBatchFinished = new AtomicBoolean(false);
     private final AtomicBoolean firstChunkLogged = new AtomicBoolean(false);
@@ -345,13 +346,10 @@ public class LceBridgeSession {
         }
         lastMovePacketMs = now;
         boolean readyForPosition = postChunkReady.get();
-        if (!readyForPosition && hasPosition) {
-            if (p.id == 13) {
-                javaSession.send(new ServerboundMovePlayerRotPacket(og, false, p.yaw, p.pitch));
-            } else {
-                javaSession.send(new ServerboundMovePlayerStatusOnlyPacket(og, false));
-            }
-            return;
+        if (!readyForPosition && hasPosition && warnedMovementBeforePostChunkReady.compareAndSet(false, true)) {
+            log.warn(
+                "Forwarding position movement before post-chunk spawn completed; some server software requires real coordinates before the chunk handshake fully settles"
+            );
         }
         boolean movedEnough = false;
         // Keep last-known pose current for heartbeat and relative teleports, even when
@@ -1034,6 +1032,10 @@ public class LceBridgeSession {
         javaChunkBatchFinished.set(true);
         log.info("Java chunk batch finished: queued={}, pending={}", queuedChunkCount, pendingChunks.size());
 
+        if (postChunkReady.get()) {
+            sendPendingTrackedEntities();
+        }
+
         // Some servers can finish the initial batch with zero chunk payloads.
         // In that case, complete spawn immediately instead of waiting for queue drain.
         if (pendingChunks.isEmpty() && postChunkSpawnSent.compareAndSet(false, true)) {
@@ -1168,6 +1170,7 @@ public class LceBridgeSession {
         tileUpdatesReadyAtMs = Long.MAX_VALUE;
         initialTeleportHandled.set(false);
         postChunkSpawnSent.set(false);
+        warnedMovementBeforePostChunkReady.set(false);
         teleportAcked.set(false);
         playerMoving.set(false);
         lastMovePacketMs = 0L;
@@ -1202,7 +1205,7 @@ public class LceBridgeSession {
             tracked.itemStack = pendingTrackedItemStacks.remove(tracked.entityId);
         }
         trackedEntities.put(tracked.entityId, tracked);
-        if (postChunkReady.get()) {
+        if (canSpawnTrackedEntities()) {
             spawnTrackedEntity(tracked);
         }
     }
@@ -1255,7 +1258,7 @@ public class LceBridgeSession {
         }
 
         tracked.itemStack = mappedItem;
-        if (!tracked.spawnedToLce && postChunkReady.get()) {
+        if (!tracked.spawnedToLce && canSpawnTrackedEntities()) {
             spawnTrackedEntity(tracked);
         } else if (tracked.spawnedToLce) {
             sendTrackedItemMetadata(tracked);
@@ -2032,7 +2035,7 @@ public class LceBridgeSession {
     }
 
     private void emitTrackedEntityTransform(TrackedEntity tracked) {
-        if (tracked == null || !postChunkReady.get()) {
+        if (tracked == null || !canSpawnTrackedEntities()) {
             return;
         }
         if (!tracked.spawnedToLce) {
@@ -2043,7 +2046,7 @@ public class LceBridgeSession {
     }
 
     private void spawnTrackedEntity(TrackedEntity tracked) {
-        if (tracked == null || !postChunkReady.get()) {
+        if (tracked == null || !canSpawnTrackedEntities()) {
             return;
         }
         if (tracked.kind == TrackedEntityKind.ITEM && tracked.itemStack == null) {
@@ -2123,7 +2126,7 @@ public class LceBridgeSession {
     }
 
     private void sendPendingTrackedEntities() {
-        if (!postChunkReady.get()) {
+        if (!canSpawnTrackedEntities()) {
             return;
         }
         for (TrackedEntity tracked : trackedEntities.values()) {
@@ -2391,6 +2394,7 @@ public class LceBridgeSession {
         lastOnGround = true;
         initialTeleportHandled.set(false);
         postChunkSpawnSent.set(false);
+        warnedMovementBeforePostChunkReady.set(false);
         teleportAcked.set(false);
         containerStateIds.clear();
         cachedContainerItems.clear();
@@ -2524,7 +2528,7 @@ public class LceBridgeSession {
 
                 // If the server announced chunk load but nothing arrives, nudge it again.
                 long started = chunkLoadStartMs;
-                if (!spawnFinished.get() && started > 0L && queuedChunkCount == 0) {
+                if (!postChunkReady.get() && started > 0L && queuedChunkCount == 0) {
                     long now = System.currentTimeMillis();
                     if (now - started >= 1500L && now - lastChunkNudgeMs >= 1000L) {
                         javaSession.send(ServerboundPlayerLoadedPacket.INSTANCE);
@@ -2540,7 +2544,7 @@ public class LceBridgeSession {
         // Safety fallback: don't leave the LCE client on the connection screen forever.
         // If chunk batching stalls for any reason, force post-chunk spawn after a short grace period.
         chunkSendScheduler.schedule(() -> {
-            if (!spawnFinished.get() && lceChannel.isActive()) {
+            if (!postChunkReady.get() && lceChannel.isActive()) {
                 boolean sawChunkActivity = queuedChunkCount > 0 || firstChunkLogged.get();
                 if (!sawChunkActivity) {
                     log.warn("Skipping post-chunk fallback because no chunks were received yet (queued={}, pending={}, batchFinished={})",
@@ -2698,8 +2702,16 @@ public class LceBridgeSession {
             pendingSetHealth = null;
         }
 
-        sendPendingTrackedEntities();
+        if (javaChunkBatchFinished.get()) {
+            sendPendingTrackedEntities();
+        } else {
+            log.warn("Deferring tracked entity spawn until Java chunk batch finish is observed");
+        }
         log.info("Post-chunk spawn complete for '{}'", playerName);
+    }
+
+    private boolean canSpawnTrackedEntities() {
+        return postChunkReady.get() && javaChunkBatchFinished.get();
     }
 
     private boolean canSendTileUpdates() {
