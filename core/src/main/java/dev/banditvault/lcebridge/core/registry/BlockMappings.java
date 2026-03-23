@@ -14,8 +14,10 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Maps Java Edition global block-state IDs to LCE numeric ID + metadata.
@@ -37,6 +39,12 @@ public class BlockMappings {
 
     private static final int MAX_STATES = 262144;
     private static final int FALLBACK_LCE = (1 << 8);
+    /**
+     * LCE world tiles must correspond to real Tile::tiles[] entries on the client.
+     * The legacy client constructs ids 1..160 and 170..173; 161..169 and 174+ are unsafe.
+     */
+    private static final int MAX_SAFE_LCE_BLOCK_ID = 173;
+    private static final Set<Integer> warnedUnsafeLceIds = Collections.synchronizedSet(new HashSet<>());
 
     private final int[] stateToLce;
     private final List<MappingRule> rules;
@@ -79,18 +87,12 @@ public class BlockMappings {
     }
 
     public int getLceId(int javaStateId) {
-        if (javaStateId < 0 || javaStateId >= stateToLce.length) {
-            return 1;
-        }
-        int packed = stateToLce[javaStateId];
+        int packed = safePackedForState(javaStateId);
         return (packed >> 8) & 0xFF;
     }
 
     public int getLceData(int javaStateId) {
-        if (javaStateId < 0 || javaStateId >= stateToLce.length) {
-            return 0;
-        }
-        return stateToLce[javaStateId] & 0xFF;
+        return safePackedForState(javaStateId) & 0xFF;
     }
 
     /**
@@ -115,7 +117,7 @@ public class BlockMappings {
 
         for (MappingRule rule : rules) {
             if (rule.matches(normalizedBlock, normalizedProps)) {
-                stateToLce[javaStateId] = rule.packedLce;
+                stateToLce[javaStateId] = sanitizePackedLce(rule.packedLce, "runtime block mapping");
                 return true;
             }
         }
@@ -151,9 +153,9 @@ public class BlockMappings {
                     continue;
                 }
                 int packed = el.getAsInt();
-                table[i] = packed;
+                table[i] = sanitizePackedLce(packed, "exact state table");
                 loaded++;
-                if (packed != FALLBACK_LCE) {
+                if (table[i] != FALLBACK_LCE) {
                     nonFallback++;
                 }
             }
@@ -191,7 +193,7 @@ public class BlockMappings {
                     }
                 }
 
-                int packed = ((lceId & 0xFF) << 8) | (lceData & 0xFF);
+                int packed = sanitizePackedLce(((lceId & 0xFF) << 8) | (lceData & 0xFF), "JSON block rule");
                 parsed.add(new MappingRule(blockName, required, packed));
             }
         } catch (Exception e) {
@@ -219,5 +221,37 @@ public class BlockMappings {
             }
         }
         return out;
+    }
+
+    private int safePackedForState(int javaStateId) {
+        if (javaStateId < 0 || javaStateId >= stateToLce.length) {
+            return FALLBACK_LCE;
+        }
+        return sanitizePackedLce(stateToLce[javaStateId], "state lookup");
+    }
+
+    private static int sanitizePackedLce(int packed, String source) {
+        int id = (packed >> 8) & 0xFF;
+        if (isSafeLceBlockId(id)) {
+            return packed;
+        }
+        warnUnsafeLceId(id, source);
+        return FALLBACK_LCE;
+    }
+
+    private static boolean isSafeLceBlockId(int id) {
+        if (id == 0) {
+            return true;
+        }
+        if (id < 0 || id > MAX_SAFE_LCE_BLOCK_ID) {
+            return false;
+        }
+        return id <= 160 || id >= 170;
+    }
+
+    private static void warnUnsafeLceId(int id, String source) {
+        if (warnedUnsafeLceIds.add(id)) {
+            log.warn("Unsafe LCE block id {} encountered from {}; falling back to stone (1:0)", id, source);
+        }
     }
 }
