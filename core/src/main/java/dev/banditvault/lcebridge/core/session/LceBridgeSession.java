@@ -16,8 +16,13 @@ import org.cloudburstmc.math.vector.Vector3d;
 import org.geysermc.mcprotocollib.network.packet.Packet;
 import org.geysermc.mcprotocollib.protocol.packet.common.clientbound.ClientboundDisconnectPacket;
 import org.geysermc.mcprotocollib.protocol.packet.common.clientbound.ClientboundKeepAlivePacket;
+import org.geysermc.mcprotocollib.protocol.packet.common.clientbound.ClientboundResourcePackPopPacket;
+import org.geysermc.mcprotocollib.protocol.packet.common.clientbound.ClientboundResourcePackPushPacket;
+import org.geysermc.mcprotocollib.protocol.packet.common.clientbound.ClientboundServerLinksPacket;
+import org.geysermc.mcprotocollib.protocol.packet.common.serverbound.ServerboundResourcePackPacket;
 import org.geysermc.mcprotocollib.protocol.packet.configuration.clientbound.ClientboundRegistryDataPacket;
 import org.geysermc.mcprotocollib.protocol.data.game.ClientCommand;
+import org.geysermc.mcprotocollib.protocol.data.game.ResourcePackStatus;
 import org.geysermc.mcprotocollib.protocol.data.game.entity.metadata.MetadataTypes;
 import org.geysermc.mcprotocollib.protocol.data.game.entity.player.Hand;
 import org.geysermc.mcprotocollib.protocol.data.game.entity.player.InteractAction;
@@ -34,6 +39,7 @@ import org.geysermc.mcprotocollib.protocol.packet.ingame.clientbound.entity.*;
 import org.geysermc.mcprotocollib.protocol.packet.ingame.clientbound.level.*;
 import org.geysermc.mcprotocollib.protocol.packet.ingame.clientbound.entity.player.*;
 import org.geysermc.mcprotocollib.protocol.packet.ingame.clientbound.inventory.*;
+import org.geysermc.mcprotocollib.protocol.packet.ingame.clientbound.scoreboard.ClientboundSetPlayerTeamPacket;
 import org.geysermc.mcprotocollib.protocol.data.game.PlayerListEntry;
 import org.geysermc.mcprotocollib.protocol.packet.ingame.serverbound.*;
 import org.geysermc.mcprotocollib.protocol.packet.ingame.serverbound.inventory.*;
@@ -84,6 +90,7 @@ public class LceBridgeSession {
     private static final int LCE_SMALL_ID         = 4; // Remote clients start at XUSER_MAX_COUNT (4) in Win64 WinsockNetLayer
     private static final int LCE_ENTITY_ID        = (LCE_SMALL_ID * 100) + 1; // = 401
     private static final long TILE_UPDATE_GRACE_MS = 2000L;
+    private static final long EARLY_POST_CHUNK_FALLBACK_MS = 1500L;
     private static final long TELEPORT_SETTLE_MS = 200L;
     private static final long ACTION_POSE_FLUSH_STALE_MS = 125L;
     private static final double FORWARDED_CORRECTION_HORIZONTAL_DELTA = 0.75d;
@@ -142,6 +149,7 @@ public class LceBridgeSession {
     private final AtomicBoolean javaChunkBatchFinished = new AtomicBoolean(false);
     private final AtomicBoolean trackedEntitiesFallbackEnabled = new AtomicBoolean(false);
     private final AtomicBoolean trackedEntitiesFallbackScheduled = new AtomicBoolean(false);
+    private final AtomicBoolean earlyPostChunkFallbackScheduled = new AtomicBoolean(false);
     private final AtomicBoolean firstChunkLogged = new AtomicBoolean(false);
     private final AtomicBoolean teleportAcked  = new AtomicBoolean(false);
     private ScheduledExecutorService tickEndScheduler;
@@ -687,6 +695,13 @@ public class LceBridgeSession {
             case ClientboundSystemChatPacket p              -> onJavaSystemChat(p);
             case ClientboundPlayerChatPacket p              -> onJavaPlayerChat(p);
             case ClientboundPlayerInfoUpdatePacket p        -> onJavaPlayerInfoUpdate(p);
+            case ClientboundPlayerInfoRemovePacket p        -> onJavaPlayerInfoRemove(p);
+            case ClientboundSetPlayerTeamPacket p           -> onJavaSetPlayerTeam(p);
+            case ClientboundEntityEventPacket p             -> onJavaEntityEvent(p);
+            case ClientboundUpdateAttributesPacket p        -> onJavaUpdateAttributes(p);
+            case ClientboundResourcePackPushPacket p        -> onJavaResourcePackPush(p);
+            case ClientboundResourcePackPopPacket p         -> onJavaResourcePackPop(p);
+            case ClientboundServerLinksPacket p             -> onJavaServerLinks(p);
             case ClientboundDisconnectPacket p              -> onJavaDisconnect(p);
             default -> {
                 String simple = pkt.getClass().getSimpleName();
@@ -720,6 +735,51 @@ public class LceBridgeSession {
             } else if (inner != null) {
                 log.debug("Unhandled bundled inner packet type: {}", inner.getClass().getSimpleName());
             }
+        }
+    }
+
+    private void onJavaSetPlayerTeam(ClientboundSetPlayerTeamPacket p) {
+        if (config.logPackets) {
+            log.debug("Ignoring Java team update team='{}' action={}", p.getTeamName(), p.getAction());
+        }
+    }
+
+    private void onJavaEntityEvent(ClientboundEntityEventPacket p) {
+        if (config.logPackets) {
+            log.debug("Ignoring Java entity event entityId={} event={}", p.getEntityId(), p.getEvent());
+        }
+    }
+
+    private void onJavaUpdateAttributes(ClientboundUpdateAttributesPacket p) {
+        if (config.logPackets) {
+            int count = p.getAttributes() == null ? 0 : p.getAttributes().size();
+            log.debug("Ignoring Java attribute update entityId={} attributes={}", p.getEntityId(), count);
+        }
+    }
+
+    private void onJavaResourcePackPush(ClientboundResourcePackPushPacket p) {
+        log.warn(
+            "Java server requested resource pack id={} required={} url={} hash={}",
+            p.getId(),
+            p.isRequired(),
+            p.getUrl(),
+            p.getHash()
+        );
+        javaSession.send(new ServerboundResourcePackPacket(p.getId(), ResourcePackStatus.ACCEPTED));
+        javaSession.send(new ServerboundResourcePackPacket(p.getId(), ResourcePackStatus.DOWNLOADED));
+        javaSession.send(new ServerboundResourcePackPacket(p.getId(), ResourcePackStatus.SUCCESSFULLY_LOADED));
+        if (spawnFinished.get()) {
+            sendChatToLce("[Bridge] Server requested a modern resource pack; acknowledging without applying it.");
+        }
+    }
+
+    private void onJavaResourcePackPop(ClientboundResourcePackPopPacket p) {
+        log.info("Java server cleared resource pack id={}", p.getId());
+    }
+
+    private void onJavaServerLinks(ClientboundServerLinksPacket p) {
+        if (config.logPackets) {
+            log.debug("Ignoring Java server links packet {}", p);
         }
     }
 
@@ -883,6 +943,7 @@ public class LceBridgeSession {
         chunkLoadStartMs = 0L;
         if (firstChunkLogged.compareAndSet(false, true)) {
             log.info("First Java chunk received at ({},{}), queue={}", p.getX(), p.getZ(), pendingChunks.size());
+            scheduleEarlyPostChunkFallback();
         }
     }
 
@@ -1184,6 +1245,7 @@ public class LceBridgeSession {
         javaChunkBatchFinished.set(false);
         trackedEntitiesFallbackEnabled.set(false);
         trackedEntitiesFallbackScheduled.set(false);
+        earlyPostChunkFallbackScheduled.set(false);
         tileUpdatesReadyAtMs = Long.MAX_VALUE;
         initialTeleportHandled.set(false);
         postChunkSpawnSent.set(false);
@@ -1514,6 +1576,17 @@ public class LceBridgeSession {
                         tracked.playerName = name;
                     }
                 }
+            }
+        }
+    }
+
+    private void onJavaPlayerInfoRemove(ClientboundPlayerInfoRemovePacket p) {
+        if (p.getProfileIds() == null) {
+            return;
+        }
+        for (java.util.UUID profileId : p.getProfileIds()) {
+            if (profileId != null) {
+                knownPlayerNames.remove(profileId);
             }
         }
     }
@@ -2470,6 +2543,7 @@ public class LceBridgeSession {
         javaChunkBatchFinished.set(false);
         trackedEntitiesFallbackEnabled.set(false);
         trackedEntitiesFallbackScheduled.set(false);
+        earlyPostChunkFallbackScheduled.set(false);
         chunkLoadStartMs = 0L;
         lastChunkNudgeMs = 0L;
         containerStateIds.clear();
@@ -2607,6 +2681,7 @@ public class LceBridgeSession {
         javaChunkBatchFinished.set(false);
         trackedEntitiesFallbackEnabled.set(false);
         trackedEntitiesFallbackScheduled.set(false);
+        earlyPostChunkFallbackScheduled.set(false);
         firstChunkLogged.set(false);
         queuedChunkCount = 0;
 
@@ -2661,6 +2736,7 @@ public class LceBridgeSession {
             chunkSendScheduler.shutdownNow();
             chunkSendScheduler = null;
         }
+        earlyPostChunkFallbackScheduled.set(false);
     }
 
     private void drainPendingChunks() {
@@ -2802,6 +2878,37 @@ public class LceBridgeSession {
             scheduleTrackedEntityFallback();
         }
         log.info("Post-chunk spawn complete for '{}'", playerName);
+    }
+
+    private void scheduleEarlyPostChunkFallback() {
+        if (chunkSendScheduler == null || chunkSendScheduler.isShutdown()) {
+            return;
+        }
+        if (!earlyPostChunkFallbackScheduled.compareAndSet(false, true)) {
+            return;
+        }
+        chunkSendScheduler.schedule(() -> {
+            earlyPostChunkFallbackScheduled.set(false);
+            if (!lceChannel.isActive() || !javaSession.isConnected()) {
+                return;
+            }
+            if (postChunkReady.get() || javaChunkBatchFinished.get()) {
+                return;
+            }
+            boolean sawChunkActivity = queuedChunkCount > 0 || firstChunkLogged.get() || !pendingChunks.isEmpty();
+            if (!sawChunkActivity) {
+                return;
+            }
+            log.warn(
+                "Forcing early post-chunk spawn fallback after chunk activity (queued={}, pending={}, batchFinished={})",
+                queuedChunkCount,
+                pendingChunks.size(),
+                javaChunkBatchFinished.get()
+            );
+            if (postChunkSpawnSent.compareAndSet(false, true)) {
+                sendPostChunkSpawn();
+            }
+        }, EARLY_POST_CHUNK_FALLBACK_MS, TimeUnit.MILLISECONDS);
     }
 
     private boolean canSpawnTrackedEntities() {
