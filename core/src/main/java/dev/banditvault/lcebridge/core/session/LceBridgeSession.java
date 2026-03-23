@@ -2898,7 +2898,7 @@ public class LceBridgeSession {
 
         // 2. ChunkVisibilityArea — batch visibility window before chunks
         ChunkVisibilityAreaPacket cva = new ChunkVisibilityAreaPacket();
-        int r = 8, cx = spawnX >> 4, cz = spawnZ >> 4;
+        int r = 16, cx = spawnX >> 4, cz = spawnZ >> 4;
         cva.minCX = cx - r; cva.maxCX = cx + r; cva.minCZ = cz - r; cva.maxCZ = cz + r;
         sendLce(cva);
 
@@ -3120,8 +3120,8 @@ public class LceBridgeSession {
             w.writeByte(0);              // [67] isGuest
             w.writeByte(1);              // [68] newSeaLevel
             w.writeInt(0);               // [69..72] gamePrivileges
-            w.writeShort(864);           // [73..74] xzSize
-            w.writeByte(3);              // [75] hellScale
+            w.writeShort(5120);          // [73..74] xzSize (Large world — 320 chunks)
+            w.writeByte(8);              // [75] hellScale (8 for Large world)
             int end = buf.writerIndex();
             int len = end - start;
             // Dump the login packet bytes so we can verify the wire format
@@ -3145,8 +3145,8 @@ public class LceBridgeSession {
             w.writeByte(1);              // difficulty
             w.writeByte(1);              // newSeaLevel = true
             w.writeShort(LCE_ENTITY_ID); // newEntityId
-            w.writeShort(864);           // xzSize
-            w.writeByte(3);              // hellScale
+            w.writeShort(5120);           // xzSize (Large world)
+            w.writeByte(8);              // hellScale (Large world)
         });
     }
 
