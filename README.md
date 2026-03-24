@@ -96,3 +96,4 @@ LCEBridge is usable for active multiplayer testing and public standalone release
 - Debug client repo: https://github.com/veroxsity/LCEDebug
 - Launcher repo: https://github.com/veroxsity/LCELauncher
 - Server repo: https://github.com/veroxsity/LCEServer
+- Save converter repo: https://github.com/veroxsity/LCE-Save-Converter
