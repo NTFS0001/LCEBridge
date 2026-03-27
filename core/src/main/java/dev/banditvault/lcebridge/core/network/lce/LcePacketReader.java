@@ -40,10 +40,7 @@ public class LcePacketReader {
             case ContainerClickPacket.ID -> readContainerClick(r);
             case ContainerButtonClickPacket.ID -> readContainerButtonClick(r);
             case DisconnectPacket.ID -> readDisconnect(r);
-            case 150 -> {
-                /* CraftItemPacket - not translated yet. */
-                yield null;
-            }
+            case CraftItemPacket.ID -> readCraftItem(r);
             default -> {
                 log.info("Unhandled LCE packet id={} ({} bytes remaining)", id, payload.readableBytes());
                 yield null;
@@ -224,6 +221,13 @@ public class LcePacketReader {
         ContainerButtonClickPacket p = new ContainerButtonClickPacket();
         p.containerId = r.readByte();
         p.buttonId = r.readUnsignedByte();
+        return p;
+    }
+
+    private static CraftItemPacket readCraftItem(LceByteReader r) {
+        CraftItemPacket p = new CraftItemPacket();
+        p.uid = r.readShort();
+        p.recipe = r.readInt();
         return p;
     }
 

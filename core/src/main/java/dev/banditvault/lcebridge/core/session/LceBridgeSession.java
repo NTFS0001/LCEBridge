@@ -6,10 +6,12 @@ import com.google.gson.JsonParser;
 import dev.banditvault.lcebridge.core.BridgeConfig;
 import dev.banditvault.lcebridge.core.chunk.CachedLceChunkColumn;
 import dev.banditvault.lcebridge.core.chunk.RleZlibCompressor;
+import dev.banditvault.lcebridge.core.inventory.LegacyInventoryCrafting;
 import dev.banditvault.lcebridge.core.network.java.JavaSession;
 import dev.banditvault.lcebridge.core.network.lce.*;
 import dev.banditvault.lcebridge.core.registry.MappingRegistry;
 import io.netty.channel.Channel;
+import net.kyori.adventure.key.Key;
 import org.cloudburstmc.nbt.NbtMap;
 import org.cloudburstmc.nbt.NbtType;
 import org.cloudburstmc.math.vector.Vector3d;
@@ -63,6 +65,7 @@ import org.geysermc.mcprotocollib.protocol.packet.ingame.serverbound.Serverbound
 import org.geysermc.mcprotocollib.protocol.data.game.setting.ChatVisibility;
 import org.geysermc.mcprotocollib.protocol.data.game.setting.ParticleStatus;
 import org.geysermc.mcprotocollib.protocol.data.game.entity.player.HandPreference;
+import org.geysermc.mcprotocollib.protocol.data.game.recipe.display.RecipeDisplayEntry;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
@@ -73,6 +76,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Queue;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.Executors;
@@ -101,6 +105,10 @@ public class LceBridgeSession {
     private static final int LCE_ITEM_ENTITY_DATA_SLOT = 10;
     private static final int MAX_REMOTE_PLAYER_ENTITIES = 64;
     private static final int MAX_CACHED_PLAYER_NAMES = 512;
+    /** Gray stained glass pane — filler for the fake crafting chest GUI. LCE block ID 160, damage 7. */
+    private static final LceItemStack CRAFTING_FILLER_ITEM = new LceItemStack(160, 1, 7);
+    /** LCE slot indices that correspond to the crafting grid + output in the fake chest. */
+    private static final int[] CRAFTING_LCE_SLOTS = {11, 12, 13, 20, 21, 22, 29, 30, 31, 15};
     private static final org.geysermc.mcprotocollib.protocol.data.game.entity.object.Direction DEFAULT_DIG_FACE =
         org.geysermc.mcprotocollib.protocol.data.game.entity.object.Direction.DOWN;
 
@@ -197,7 +205,13 @@ public class LceBridgeSession {
     private volatile byte lastJavaAbilityFlags = 0;
     private volatile float lastJavaFlySpeed = 0.05f;
     private volatile float lastJavaWalkSpeed = 0.1f;
+    private volatile int activeCraftingContainerId = 0;
     private final Map<Integer, Integer> containerStateIds = new ConcurrentHashMap<>();
+    private final Set<Integer> craftingContainerIds = ConcurrentHashMap.newKeySet();
+    private final Map<Integer, LceItemStack> javaPlayerContainerSlots = new ConcurrentHashMap<>();
+    private final Map<Key, Set<String>> javaRecipeItemSets = new ConcurrentHashMap<>();
+    private final Map<Integer, RecipeDisplayEntry> javaInventoryCraftEntries = new ConcurrentHashMap<>();
+    private final Map<Integer, LegacyInventoryCrafting.JavaRecipeCandidate> javaInventoryCraftRecipes = new ConcurrentHashMap<>();
     private final Map<Long, CachedLceChunkColumn> translatedChunkCache = new ConcurrentHashMap<>();
     private final Map<Integer, TrackedEntity> trackedEntities = new ConcurrentHashMap<>();
     private final Map<Integer, LceItemStack> pendingTrackedItemStacks = new ConcurrentHashMap<>();
@@ -207,10 +221,14 @@ public class LceBridgeSession {
     private final AtomicInteger activeRemotePlayerCount = new AtomicInteger(0);
     private volatile int currentLevelIdx = 0;
     private volatile int javaEntityId = -1; // The player's entity ID on the Java server
+    private volatile PendingInventoryCraft pendingInventoryCraft = null;
 
     private String playerName = "Unknown";
     private long offlineXuid  = 0L, onlineXuid = 0L;
     private int spawnX = 0, spawnY = 64, spawnZ = 0;
+
+    private record PendingInventoryCraft(int legacyRecipeIndex, int javaRecipeId) {
+    }
 
     public LceBridgeSession(BridgeConfig config, Channel lceChannel) {
         this.config     = config;
@@ -246,6 +264,7 @@ public class LceBridgeSession {
             case ContainerClosePacket p  -> handleContainerClose(p);
             case ContainerClickPacket p  -> handleContainerClick(p);
             case ContainerButtonClickPacket p -> handleContainerButtonClick(p);
+            case CraftItemPacket p       -> handleCraftItem(p);
             case PlayerAbilitiesPacket p -> {}
             case DebugOptionsPacket p    -> {}
             case DisconnectPacket p      -> handleLceDisconnect(p);
@@ -605,11 +624,34 @@ public class LceBridgeSession {
         if (!javaSession.isConnected()) return;
         containerStateIds.remove(p.containerId);
         cachedContainerItems.remove(p.containerId);
+        craftingContainerIds.remove(p.containerId);
+        clearActiveCraftingContainerIfMatches(p.containerId);
         javaSession.send(new ServerboundContainerClosePacket(p.containerId));
     }
 
     private void handleContainerClick(ContainerClickPacket p) {
         if (!javaSession.isConnected()) return;
+
+        boolean isCrafting = craftingContainerIds.contains(p.containerId);
+        if (isCrafting) {
+            log.info("[CRAFT-DBG] handleContainerClick containerId={} lceSlot={} button={} clickType={} item={}",
+                p.containerId, p.slotNum, p.buttonNum, p.clickType, p.item);
+        }
+
+        // For crafting containers, validate the clicked LCE slot maps to a valid Java slot
+        if (isCrafting && p.slotNum >= 0) {
+            int javaSlot = lceCraftSlotToJava(p.slotNum);
+            if (javaSlot == -1) {
+                // Clicked a filler/unmapped slot in the fake chest — ignore
+                log.debug("Crafting container: ignoring click on unmapped LCE slot {}", p.slotNum);
+                ContainerAckPacket ack = new ContainerAckPacket();
+                ack.containerId = p.containerId;
+                ack.uid = p.uid;
+                ack.accepted = false;
+                sendLce(ack);
+                return;
+            }
+        }
 
         ContainerActionType actionType;
         ContainerAction action;
@@ -630,15 +672,35 @@ public class LceBridgeSession {
             return;
         }
 
+        // Prediction uses LCE slot indices (cache is LCE-indexed) — do NOT translate p.slotNum yet
         PredictedContainerClick prediction = predictContainerClick(p);
+
+        // For the Java packet, translate LCE slot → Java slot and remap changedSlots keys
+        int javaSlotNum = p.slotNum;
+        var changedSlots = prediction.changedSlots();
+        if (isCrafting && p.slotNum >= 0) {
+            javaSlotNum = lceCraftSlotToJava(p.slotNum);
+            // Remap changedSlots keys from LCE indices to Java indices
+            var remapped = new it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap<HashedStack>();
+            for (var entry : changedSlots.int2ObjectEntrySet()) {
+                int javaKey = lceCraftSlotToJava(entry.getIntKey());
+                if (javaKey >= 0) {
+                    remapped.put(javaKey, entry.getValue());
+                }
+            }
+            changedSlots = remapped;
+            log.info("[CRAFT-DBG]   -> sending to Java: javaSlot={} changedSlots={} carriedItem={}",
+                javaSlotNum, changedSlots, prediction.carriedItem());
+        }
+
         javaSession.send(new ServerboundContainerClickPacket(
             p.containerId,
             containerStateIds.getOrDefault(p.containerId, 0),
-            p.slotNum,
+            javaSlotNum,
             actionType,
             action,
             MappingRegistry.items().toJavaHashed(prediction.carriedItem()),
-            prediction.changedSlots()
+            changedSlots
         ));
 
         ContainerAckPacket ack = new ContainerAckPacket();
@@ -653,15 +715,64 @@ public class LceBridgeSession {
         javaSession.send(new ServerboundContainerButtonClickPacket(p.containerId, p.buttonId));
     }
 
+    private void handleCraftItem(CraftItemPacket p) {
+        if (!javaSession.isConnected()) return;
+
+        LegacyInventoryCrafting.LegacyRecipe legacyRecipe = LegacyInventoryCrafting.recipeForIndex(p.recipe);
+        if (legacyRecipe == null) {
+            log.info("[CRAFT-DBG] Unsupported legacy inventory recipe index={}", p.recipe);
+            return;
+        }
+
+        LegacyInventoryCrafting.JavaRecipeCandidate candidate = null;
+        LegacyInventoryCrafting.JavaRecipeCandidate fallbackCandidate = null;
+        for (LegacyInventoryCrafting.JavaRecipeCandidate javaRecipe : javaInventoryCraftRecipes.values()) {
+            if (!LegacyInventoryCrafting.matches(legacyRecipe, javaRecipe)) {
+                continue;
+            }
+            if (fallbackCandidate == null) {
+                fallbackCandidate = javaRecipe;
+            }
+            List<LceItemStack> visibleInventory = cachedContainerItems.getOrDefault(0, List.of());
+            if (!visibleInventory.isEmpty() && !LegacyInventoryCrafting.canCraft(javaRecipe, visibleInventory, MappingRegistry.items())) {
+                continue;
+            }
+            candidate = javaRecipe;
+            break;
+        }
+
+        if (candidate == null && fallbackCandidate != null) {
+            candidate = fallbackCandidate;
+            log.info("[CRAFT-DBG] Inventory craft legacyIndex={} using recipeId={} despite local ingredient uncertainty",
+                p.recipe, candidate.recipeId());
+        }
+
+        if (candidate == null) {
+            if (tryManualInventoryCraft(legacyRecipe, p.recipe)) {
+                return;
+            }
+            log.info("[CRAFT-DBG] No Java inventory recipe matched legacy index={} result={}",
+                p.recipe, legacyRecipe.resultKey());
+            return;
+        }
+
+        pendingInventoryCraft = new PendingInventoryCraft(p.recipe, candidate.recipeId());
+        log.info("[CRAFT-DBG] Inventory craft legacyIndex={} -> javaRecipeId={} result={}",
+            p.recipe, candidate.recipeId(), candidate.resultKey());
+        javaSession.send(new ServerboundPlaceRecipePacket(0, candidate.recipeId(), false));
+    }
+
     private void handleLceDisconnect(DisconnectPacket p) {
         log.info("LCE client '{}' disconnected ({})", playerName, p.reason);
         stopClientTickLoop();
+        pendingInventoryCraft = null;
         javaSession.disconnect("Client disconnected");
     }
 
     public void handleLceTransportClosed(String reason) {
         log.info("LCE transport closed for '{}': {}", playerName, reason);
         stopClientTickLoop();
+        pendingInventoryCraft = null;
         javaSession.disconnect(reason);
     }
 
@@ -701,6 +812,8 @@ public class LceBridgeSession {
             case ClientboundTeleportEntityPacket p          -> onJavaTeleportEntity(p);
             case ClientboundDelimiterPacket p               -> onJavaDelimiter(p);
             case ClientboundOpenScreenPacket p              -> onJavaOpenScreen(p);
+            case ClientboundUpdateRecipesPacket p          -> onJavaUpdateRecipes(p);
+            case ClientboundRecipeBookAddPacket p           -> onJavaRecipeBookAdd(p);
             case ClientboundContainerSetContentPacket p     -> onJavaContainerSetContent(p);
             case ClientboundContainerSetSlotPacket p        -> onJavaContainerSetSlot(p);
             case ClientboundContainerSetDataPacket p        -> onJavaContainerSetData(p);
@@ -732,6 +845,7 @@ public class LceBridgeSession {
     private void onJavaDisconnect(ClientboundDisconnectPacket p) {
         log.info("Java sent disconnect for '{}': {}", playerName, p.getReason());
         stopClientTickLoop();
+        pendingInventoryCraft = null;
         sendLce(makeDisconnect(2));
         lceChannel.close();
     }
@@ -1039,16 +1153,119 @@ public class LceBridgeSession {
     }
 
     private void onJavaOpenScreen(ClientboundOpenScreenPacket p) {
+        log.info("[CRAFT-DBG] onJavaOpenScreen type={} containerId={}", p.getType(), p.getContainerId());
         ContainerOpenPacket open = translateOpenScreen(p);
         if (open == null) {
             log.info("Ignoring unsupported Java container type {}", p.getType());
             return;
         }
         containerStateIds.put(p.getContainerId(), 0);
+        activeCraftingContainerId = craftingContainerIds.contains(p.getContainerId()) ? p.getContainerId() : 0;
+        log.info("[CRAFT-DBG] Sending LCE container open type={} size={} customName={} title='{}'",
+            open.type, open.size, open.customName, open.title);
         sendLce(open);
+
+        // For crafting containers, immediately send filler content so the player sees the grid layout
+        if (craftingContainerIds.contains(p.getContainerId())) {
+            sendCraftingFillerContent(p.getContainerId());
+        }
+    }
+
+    private void onJavaRecipeBookAdd(ClientboundRecipeBookAddPacket p) {
+        if (p.isReplace()) {
+            javaInventoryCraftEntries.clear();
+            javaInventoryCraftRecipes.clear();
+        }
+
+        int added = 0;
+        if (p.getEntries() != null) {
+            for (ClientboundRecipeBookAddPacket.Entry entry : p.getEntries()) {
+                javaInventoryCraftEntries.put(entry.contents().id(), entry.contents());
+                LegacyInventoryCrafting.JavaRecipeCandidate candidate =
+                    LegacyInventoryCrafting.fromRecipeDisplayEntry(entry.contents(), MappingRegistry.items(), javaRecipeItemSets);
+                if (candidate == null) {
+                    continue;
+                }
+                javaInventoryCraftRecipes.put(candidate.recipeId(), candidate);
+                added++;
+            }
+        }
+
+        if (added > 0 || p.isReplace()) {
+            log.info("[CRAFT-DBG] Cached {} Java inventory recipe-book entries (replace={})",
+                javaInventoryCraftRecipes.size(), p.isReplace());
+        }
+    }
+
+    private void onJavaUpdateRecipes(ClientboundUpdateRecipesPacket p) {
+        javaRecipeItemSets.clear();
+
+        if (p.getItemSets() != null) {
+            for (Map.Entry<Key, int[]> entry : p.getItemSets().entrySet()) {
+                List<String> itemNames = new java.util.ArrayList<>(entry.getValue().length);
+                for (int protocolItemId : entry.getValue()) {
+                    String javaName = MappingRegistry.items().javaName(protocolItemId);
+                    if (javaName != null && !javaName.isBlank()) {
+                        itemNames.add(javaName);
+                    }
+                }
+
+                Set<String> acceptedKeys = LegacyInventoryCrafting.acceptedKeysForJavaNames(itemNames);
+                if (!acceptedKeys.isEmpty()) {
+                    javaRecipeItemSets.put(entry.getKey(), acceptedKeys);
+                }
+            }
+        }
+
+        if (!javaInventoryCraftEntries.isEmpty()) {
+            javaInventoryCraftRecipes.clear();
+            for (RecipeDisplayEntry entry : javaInventoryCraftEntries.values()) {
+                LegacyInventoryCrafting.JavaRecipeCandidate candidate =
+                    LegacyInventoryCrafting.fromRecipeDisplayEntry(entry, MappingRegistry.items(), javaRecipeItemSets);
+                if (candidate != null) {
+                    javaInventoryCraftRecipes.put(candidate.recipeId(), candidate);
+                }
+            }
+        }
+
+        log.info("[CRAFT-DBG] Cached {} Java recipe item sets; {} inventory recipes ready",
+            javaRecipeItemSets.size(), javaInventoryCraftRecipes.size());
+    }
+
+    /** Sends an 81-slot content packet (45 chest + 36 player inv) with glass pane fillers and empty crafting/output slots. */
+    private void sendCraftingFillerContent(int containerId) {
+        ContainerSetContentPacket content = new ContainerSetContentPacket();
+        content.containerId = containerId;
+        // 45 chest slots (filler) + 36 player inv slots (null) = 81 total
+        List<LceItemStack> lceSlots = new java.util.ArrayList<>(Collections.nCopies(45, CRAFTING_FILLER_ITEM));
+        // Clear the 10 crafting slots (grid + output) so they appear empty/usable
+        for (int s : CRAFTING_LCE_SLOTS) lceSlots.set(s, null);
+        // Append 36 null player inventory slots
+        for (int i = 0; i < 36; i++) lceSlots.add(null);
+        List<LceItemStack> cachedItems = new java.util.ArrayList<>();
+        for (LceItemStack item : lceSlots) {
+            content.items.add(item);
+            cachedItems.add(copyLceItem(item));
+        }
+        cachedContainerItems.put(containerId, cachedItems);
+        sendLce(content);
     }
 
     private void onJavaContainerSetContent(ClientboundContainerSetContentPacket p) {
+        if (p.getContainerId() == 0 && p.getItems() != null) {
+            cacheJavaPlayerContainerContent(p.getItems());
+            if (p.getItems().length > 0 && p.getItems()[0] != null) {
+                tryCompletePendingInventoryCraft(p.getItems()[0]);
+            }
+            onJavaPlayerInventoryContainerSetContent(p);
+            return;
+        }
+        if (craftingContainerIds.contains(p.getContainerId())) {
+            log.info("[CRAFT-DBG] onJavaContainerSetContent containerId={} itemCount={}",
+                p.getContainerId(), p.getItems() != null ? p.getItems().length : 0);
+            onJavaCraftingContainerSetContent(p);
+            return;
+        }
         ContainerSetContentPacket content = new ContainerSetContentPacket();
         content.containerId = p.getContainerId();
         List<LceItemStack> cachedItems = new java.util.ArrayList<>();
@@ -1065,12 +1282,115 @@ public class LceBridgeSession {
         sendCursorItem(p.getCarriedItem());
     }
 
+    private void onJavaPlayerInventoryContainerSetContent(ClientboundContainerSetContentPacket p) {
+        ContainerSetContentPacket content = new ContainerSetContentPacket();
+        content.containerId = 0;
+
+        List<LceItemStack> lceSlots = new java.util.ArrayList<>(Collections.nCopies(45, null));
+        if (p.getItems() != null) {
+            for (int javaSlot = 0; javaSlot < p.getItems().length; javaSlot++) {
+                int lceSlot = translateJavaPlayerContainerSlotToLce(javaSlot);
+                if (lceSlot < 0 || lceSlot >= lceSlots.size()) {
+                    continue;
+                }
+                lceSlots.set(lceSlot, MappingRegistry.items().toLce(p.getItems()[javaSlot]));
+            }
+        }
+
+        List<LceItemStack> cachedItems = new java.util.ArrayList<>(lceSlots.size());
+        for (LceItemStack item : lceSlots) {
+            content.items.add(item);
+            cachedItems.add(copyLceItem(item));
+        }
+
+        cachedContainerItems.put(0, cachedItems);
+        containerStateIds.put(0, p.getStateId());
+        sendLce(content);
+        sendCursorItem(p.getCarriedItem());
+    }
+
+    private void onJavaCraftingContainerSetContent(ClientboundContainerSetContentPacket p) {
+        // Java sends 46 slots: 0=output, 1-9=grid, 10-36=main inv, 37-45=hotbar.
+        // We remap to LCE's combined view: 45 chest slots + 36 player inv = 81 total.
+        // First 45 slots: glass pane filler with crafting slots cleared.
+        // Remaining 36 slots: player inventory mapped from Java slots 10-45.
+        ContainerSetContentPacket content = new ContainerSetContentPacket();
+        content.containerId = p.getContainerId();
+
+        // Initialize 45 chest slots with filler glass panes
+        List<LceItemStack> lceSlots = new java.util.ArrayList<>(Collections.nCopies(45, CRAFTING_FILLER_ITEM));
+        // Clear the 10 crafting slots (they show empty unless Java has items)
+        for (int s : CRAFTING_LCE_SLOTS) lceSlots.set(s, null);
+
+        if (p.getItems() != null) {
+            // Map crafting slots (Java 0-9 → LCE positions in the chest)
+            for (int javaSlot = 0; javaSlot < Math.min(p.getItems().length, 10); javaSlot++) {
+                int lceSlot = javaCraftSlotToLce(javaSlot);
+                if (lceSlot >= 0 && lceSlot < 45) {
+                    lceSlots.set(lceSlot, MappingRegistry.items().toLce(p.getItems()[javaSlot]));
+                }
+            }
+            // Append player inventory slots (Java 10-45 → LCE 45-80)
+            for (int javaSlot = 10; javaSlot < Math.min(p.getItems().length, 46); javaSlot++) {
+                lceSlots.add(MappingRegistry.items().toLce(p.getItems()[javaSlot]));
+            }
+        }
+
+        List<LceItemStack> cachedItems = new java.util.ArrayList<>();
+        for (LceItemStack item : lceSlots) {
+            content.items.add(item);
+            cachedItems.add(copyLceItem(item));
+        }
+
+        cachedContainerItems.put(p.getContainerId(), cachedItems);
+        containerStateIds.put(p.getContainerId(), p.getStateId());
+        sendLce(content);
+        sendCursorItem(p.getCarriedItem());
+    }
+
     private void onJavaContainerSetSlot(ClientboundContainerSetSlotPacket p) {
+        if (p.getContainerId() == 0 && isHiddenPlayerCraftingSlot(p.getSlot())) {
+            setJavaPlayerContainerSlot(p.getSlot(), MappingRegistry.items().toLce(p.getItem()));
+            containerStateIds.put(0, p.getStateId());
+            if (p.getSlot() == 0) {
+                tryCompletePendingInventoryCraft(p.getItem());
+            }
+            return;
+        }
+
+        if (p.getContainerId() == 0) {
+            setJavaPlayerContainerSlot(p.getSlot(), MappingRegistry.items().toLce(p.getItem()));
+            int lceSlot = translateJavaPlayerContainerSlotToLce(p.getSlot());
+            containerStateIds.put(0, p.getStateId());
+            if (lceSlot < 0) {
+                return;
+            }
+
+            ContainerSetSlotPacket slot = new ContainerSetSlotPacket();
+            slot.containerId = 0;
+            slot.slot = lceSlot;
+            slot.item = MappingRegistry.items().toLce(p.getItem());
+            setCachedContainerSlot(0, lceSlot, slot.item);
+            sendLce(slot);
+            return;
+        }
+
+        int lceSlot = p.getSlot();
+
+        // Translate Java crafting slot to LCE fake-chest slot
+        if (craftingContainerIds.contains(p.getContainerId())) {
+            log.info("[CRAFT-DBG] onJavaContainerSetSlot containerId={} javaSlot={} item={}",
+                p.getContainerId(), p.getSlot(), p.getItem());
+            lceSlot = javaCraftSlotToLce(p.getSlot());
+            log.info("[CRAFT-DBG]   -> translated to lceSlot={}", lceSlot);
+            if (lceSlot < 0) return; // unmapped — shouldn't happen
+        }
+
         ContainerSetSlotPacket slot = new ContainerSetSlotPacket();
         slot.containerId = p.getContainerId();
-        slot.slot = p.getSlot();
+        slot.slot = lceSlot;
         slot.item = MappingRegistry.items().toLce(p.getItem());
-        setCachedContainerSlot(p.getContainerId(), p.getSlot(), slot.item);
+        setCachedContainerSlot(p.getContainerId(), lceSlot, slot.item);
         containerStateIds.put(p.getContainerId(), p.getStateId());
         sendLce(slot);
     }
@@ -1088,10 +1408,17 @@ public class LceBridgeSession {
         close.containerId = p.getContainerId();
         containerStateIds.remove(p.getContainerId());
         cachedContainerItems.remove(p.getContainerId());
+        craftingContainerIds.remove(p.getContainerId());
+        clearActiveCraftingContainerIfMatches(p.getContainerId());
+        pendingInventoryCraft = null;
         sendLce(close);
     }
 
     private void onJavaSetPlayerInventory(ClientboundSetPlayerInventoryPacket p) {
+        int javaContainerSlot = translateJavaPlayerInventorySlotToContainerSlot(p.getSlot());
+        if (javaContainerSlot >= 0) {
+            setJavaPlayerContainerSlot(javaContainerSlot, MappingRegistry.items().toLce(p.getContents()));
+        }
         int translatedSlot = translateJavaPlayerInventorySlotToLce(p.getSlot());
         if (translatedSlot < 0) {
             log.debug("Ignoring unsupported Java player inventory slot {}", p.getSlot());
@@ -1103,6 +1430,7 @@ public class LceBridgeSession {
         slot.item = MappingRegistry.items().toLce(p.getContents());
         setCachedContainerSlot(0, translatedSlot, slot.item);
         sendLce(slot);
+        mirrorPlayerInventoryUpdateIntoCraftingContainer(p.getSlot(), slot.item);
     }
 
     private void onJavaSetCursorItem(ClientboundSetCursorItemPacket p) {
@@ -1250,9 +1578,13 @@ public class LceBridgeSession {
     private void onJavaRespawn(ClientboundRespawnPacket p) {
         // Match your server behavior: send LCE Respawn first, then Java will
         // naturally follow with health + teleport updates.
+        pendingInventoryCraft = null;
         updateLevelIdx(p.getCommonPlayerSpawnInfo());
         containerStateIds.clear();
         cachedContainerItems.clear();
+        craftingContainerIds.clear();
+        javaPlayerContainerSlots.clear();
+        activeCraftingContainerId = 0;
         cachedCursorItem = null;
         spawnFinished.set(false);
         postChunkReady.set(false);
@@ -1732,6 +2064,258 @@ public class LceBridgeSession {
     ) {
     }
 
+    private boolean tryManualInventoryCraft(LegacyInventoryCrafting.LegacyRecipe legacyRecipe, int legacyRecipeIndex) {
+        List<ManualInventoryCraftPlacement> placements = planManualInventoryCraft(legacyRecipe);
+        if (placements.isEmpty()) {
+            return false;
+        }
+
+        log.info("[CRAFT-DBG] Manual inventory craft legacyIndex={} result={} placements={}",
+            legacyRecipeIndex, legacyRecipe.resultKey(), placements);
+
+        LceItemStack carried = null;
+        for (int slot = 1; slot <= 4; slot++) {
+            LceItemStack existing = getJavaPlayerContainerSlot(slot);
+            if (existing != null && existing.count > 0) {
+                carried = sendSyntheticPlayerContainerClick(slot, 0, 1, carried);
+            }
+        }
+        if (carried != null) {
+            log.info("[CRAFT-DBG] Manual inventory craft aborted while clearing hidden grid, carried={}", carried);
+            return false;
+        }
+
+        pendingInventoryCraft = new PendingInventoryCraft(legacyRecipeIndex, -1);
+
+        Map<Integer, List<Integer>> placementsBySource = new java.util.LinkedHashMap<>();
+        for (ManualInventoryCraftPlacement placement : placements) {
+            placementsBySource.computeIfAbsent(placement.sourceSlot(), ignored -> new java.util.ArrayList<>())
+                .add(placement.targetSlot());
+        }
+
+        for (Map.Entry<Integer, List<Integer>> entry : placementsBySource.entrySet()) {
+            carried = sendSyntheticPlayerContainerClick(entry.getKey(), 0, 0, carried);
+            for (int targetSlot : entry.getValue()) {
+                carried = sendSyntheticPlayerContainerClick(targetSlot, 1, 0, carried);
+            }
+            carried = sendSyntheticPlayerContainerClick(entry.getKey(), 0, 0, carried);
+        }
+
+        if (carried != null) {
+            carried = sendSyntheticPlayerContainerClick(ServerboundContainerClickPacket.CLICK_OUTSIDE_NOT_HOLDING_SLOT, 0, 0, carried);
+        }
+
+        return carried == null;
+    }
+
+    private List<ManualInventoryCraftPlacement> planManualInventoryCraft(LegacyInventoryCrafting.LegacyRecipe legacyRecipe) {
+        List<ManualInventoryCraftTarget> targets = manualInventoryCraftTargets(legacyRecipe);
+        if (targets.isEmpty()) {
+            return List.of();
+        }
+
+        List<AvailableManualInventoryStack> available = new java.util.ArrayList<>();
+        for (int slot = 9; slot <= 44; slot++) {
+            LceItemStack stack = getJavaPlayerContainerSlot(slot);
+            if (stack == null || stack.count <= 0) {
+                continue;
+            }
+            String javaName = MappingRegistry.items().javaName(stack);
+            Set<String> acceptedKeys = LegacyInventoryCrafting.acceptedKeysForJavaName(javaName);
+            if (acceptedKeys.isEmpty()) {
+                continue;
+            }
+            available.add(new AvailableManualInventoryStack(slot, acceptedKeys, stack.count));
+        }
+
+        List<ManualInventoryCraftPlacement> placements = new java.util.ArrayList<>();
+        for (ManualInventoryCraftTarget target : targets) {
+            AvailableManualInventoryStack source = null;
+            for (AvailableManualInventoryStack candidate : available) {
+                if (candidate.remaining <= 0 || !candidate.acceptedKeys.contains(target.ingredientKey())) {
+                    continue;
+                }
+                source = candidate;
+                break;
+            }
+            if (source == null) {
+                return List.of();
+            }
+
+            source.remaining--;
+            placements.add(new ManualInventoryCraftPlacement(source.slot, target.targetSlot()));
+        }
+        return placements;
+    }
+
+    private List<ManualInventoryCraftTarget> manualInventoryCraftTargets(LegacyInventoryCrafting.LegacyRecipe legacyRecipe) {
+        List<ManualInventoryCraftTarget> targets = new java.util.ArrayList<>();
+        if (legacyRecipe.shaped()) {
+            for (int row = 0; row < legacyRecipe.height(); row++) {
+                for (int col = 0; col < legacyRecipe.width(); col++) {
+                    int ingredientIndex = row * legacyRecipe.width() + col;
+                    if (ingredientIndex >= legacyRecipe.ingredients().size()) {
+                        continue;
+                    }
+                    String ingredientKey = legacyRecipe.ingredients().get(ingredientIndex);
+                    if (ingredientKey == null) {
+                        continue;
+                    }
+                    int targetSlot = playerCraftGridSlot(col, row);
+                    if (targetSlot >= 0) {
+                        targets.add(new ManualInventoryCraftTarget(targetSlot, ingredientKey));
+                    }
+                }
+            }
+            return targets;
+        }
+
+        int targetSlot = 1;
+        for (String ingredientKey : legacyRecipe.ingredients()) {
+            if (ingredientKey == null) {
+                continue;
+            }
+            targets.add(new ManualInventoryCraftTarget(targetSlot++, ingredientKey));
+        }
+        return targets;
+    }
+
+    private int playerCraftGridSlot(int col, int row) {
+        return switch (row * 2 + col) {
+            case 0 -> 1;
+            case 1 -> 2;
+            case 2 -> 3;
+            case 3 -> 4;
+            default -> -1;
+        };
+    }
+
+    private LceItemStack sendSyntheticPlayerContainerClick(int slotNum, int buttonNum, int clickType, LceItemStack carriedBefore) {
+        ContainerActionType actionType;
+        ContainerAction action;
+        if (slotNum == ServerboundContainerClickPacket.CLICK_OUTSIDE_NOT_HOLDING_SLOT) {
+            actionType = ContainerActionType.DROP_ITEM;
+            action = buttonNum == 1
+                ? DropItemAction.RIGHT_CLICK_OUTSIDE_NOT_HOLDING
+                : DropItemAction.LEFT_CLICK_OUTSIDE_NOT_HOLDING;
+        } else if (clickType == 0) {
+            actionType = ContainerActionType.CLICK_ITEM;
+            action = buttonNum == 1 ? ClickItemAction.RIGHT_CLICK : ClickItemAction.LEFT_CLICK;
+        } else if (clickType == 1) {
+            actionType = ContainerActionType.SHIFT_CLICK_ITEM;
+            action = buttonNum == 1 ? ShiftClickItemAction.RIGHT_CLICK : ShiftClickItemAction.LEFT_CLICK;
+        } else {
+            return carriedBefore;
+        }
+
+        it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap<HashedStack> changedSlots =
+            new it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap<>();
+        LceItemStack carriedAfter = copyLceItem(carriedBefore);
+        LceItemStack slotBefore = slotNum >= 0 ? getJavaPlayerContainerSlot(slotNum) : null;
+        LceItemStack slotAfter = copyLceItem(slotBefore);
+
+        if (slotNum == ServerboundContainerClickPacket.CLICK_OUTSIDE_NOT_HOLDING_SLOT) {
+            if (carriedBefore != null) {
+                if (buttonNum == 0 || carriedBefore.count <= 1) {
+                    carriedAfter = null;
+                } else {
+                    carriedAfter = new LceItemStack(carriedBefore.id, carriedBefore.count - 1, carriedBefore.damage);
+                }
+            }
+        } else if (clickType == 0) {
+            if (carriedBefore == null) {
+                if (slotBefore != null) {
+                    if (buttonNum == 0) {
+                        carriedAfter = copyLceItem(slotBefore);
+                        slotAfter = null;
+                    } else {
+                        int take = (slotBefore.count + 1) / 2;
+                        carriedAfter = new LceItemStack(slotBefore.id, take, slotBefore.damage);
+                        int remain = slotBefore.count - take;
+                        slotAfter = remain > 0 ? new LceItemStack(slotBefore.id, remain, slotBefore.damage) : null;
+                    }
+                }
+            } else if (slotBefore == null) {
+                int place = buttonNum == 0 ? carriedBefore.count : 1;
+                slotAfter = new LceItemStack(carriedBefore.id, place, carriedBefore.damage);
+                int remain = carriedBefore.count - place;
+                carriedAfter = remain > 0 ? new LceItemStack(carriedBefore.id, remain, carriedBefore.damage) : null;
+            } else if (canStackLceItems(slotBefore, carriedBefore)) {
+                int room = 64 - slotBefore.count;
+                int moved = Math.min(room, buttonNum == 0 ? carriedBefore.count : 1);
+                if (moved > 0) {
+                    slotAfter = new LceItemStack(slotBefore.id, slotBefore.count + moved, slotBefore.damage);
+                    int remain = carriedBefore.count - moved;
+                    carriedAfter = remain > 0 ? new LceItemStack(carriedBefore.id, remain, carriedBefore.damage) : null;
+                }
+            } else if (buttonNum == 0) {
+                slotAfter = copyLceItem(carriedBefore);
+                carriedAfter = copyLceItem(slotBefore);
+            }
+        } else if (clickType == 1 && slotBefore != null) {
+            slotAfter = null;
+        }
+
+        if (slotNum >= 0 && !sameLceItem(slotBefore, slotAfter)) {
+            setJavaPlayerContainerSlot(slotNum, slotAfter);
+            changedSlots.put(slotNum, MappingRegistry.items().toJavaHashed(slotAfter));
+        }
+
+        javaSession.send(new ServerboundContainerClickPacket(
+            0,
+            containerStateIds.getOrDefault(0, 0),
+            slotNum,
+            actionType,
+            action,
+            MappingRegistry.items().toJavaHashed(carriedAfter),
+            changedSlots
+        ));
+
+        log.info("[CRAFT-DBG] synthetic player click slot={} button={} clickType={} changedSlots={} carriedBefore={} carriedAfter={}",
+            slotNum, buttonNum, clickType, changedSlots, carriedBefore, carriedAfter);
+        return carriedAfter;
+    }
+
+    private void cacheJavaPlayerContainerContent(org.geysermc.mcprotocollib.protocol.data.game.item.ItemStack[] items) {
+        javaPlayerContainerSlots.clear();
+        for (int slot = 0; slot < items.length; slot++) {
+            setJavaPlayerContainerSlot(slot, MappingRegistry.items().toLce(items[slot]));
+        }
+    }
+
+    private LceItemStack getJavaPlayerContainerSlot(int slot) {
+        return copyLceItem(javaPlayerContainerSlots.get(slot));
+    }
+
+    private void setJavaPlayerContainerSlot(int slot, LceItemStack item) {
+        if (slot < 0) {
+            return;
+        }
+        if (item == null) {
+            javaPlayerContainerSlots.remove(slot);
+        } else {
+            javaPlayerContainerSlots.put(slot, copyLceItem(item));
+        }
+    }
+
+    private record ManualInventoryCraftTarget(int targetSlot, String ingredientKey) {
+    }
+
+    private record ManualInventoryCraftPlacement(int sourceSlot, int targetSlot) {
+    }
+
+    private static final class AvailableManualInventoryStack {
+        private final int slot;
+        private final Set<String> acceptedKeys;
+        private int remaining;
+
+        private AvailableManualInventoryStack(int slot, Set<String> acceptedKeys, int remaining) {
+            this.slot = slot;
+            this.acceptedKeys = acceptedKeys;
+            this.remaining = remaining;
+        }
+    }
+
     private void predictSelectedHotbarDrop(boolean fullStack) {
         int slot = selectedHotbarInventorySlot();
         LceItemStack existing = getCachedContainerSlot(0, slot);
@@ -1778,6 +2362,60 @@ public class LceBridgeSession {
         sendLce(update);
     }
 
+    private boolean isHiddenPlayerCraftingSlot(int javaSlot) {
+        return javaSlot >= 0 && javaSlot <= 4;
+    }
+
+    private void tryCompletePendingInventoryCraft(org.geysermc.mcprotocollib.protocol.data.game.item.ItemStack resultItem) {
+        PendingInventoryCraft pending = pendingInventoryCraft;
+        if (pending == null || resultItem == null || resultItem.getAmount() <= 0) {
+            return;
+        }
+
+        pendingInventoryCraft = null;
+        var changedSlots = new it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap<HashedStack>();
+        changedSlots.put(0, null);
+        javaSession.send(new ServerboundContainerClickPacket(
+            0,
+            containerStateIds.getOrDefault(0, 0),
+            0,
+            ContainerActionType.SHIFT_CLICK_ITEM,
+            ShiftClickItemAction.LEFT_CLICK,
+            null,
+            changedSlots
+        ));
+        log.info("[CRAFT-DBG] Auto-taking player inventory craft result for legacyIndex={} javaRecipeId={}",
+            pending.legacyRecipeIndex(), pending.javaRecipeId());
+    }
+
+    private void clearActiveCraftingContainerIfMatches(int containerId) {
+        if (activeCraftingContainerId == containerId) {
+            activeCraftingContainerId = 0;
+        }
+    }
+
+    private void mirrorPlayerInventoryUpdateIntoCraftingContainer(int javaPlayerInventorySlot, LceItemStack item) {
+        int containerId = activeCraftingContainerId;
+        if (containerId == 0 || !craftingContainerIds.contains(containerId)) {
+            return;
+        }
+
+        int lceSlot = javaPlayerInventorySlotToCraftingLce(javaPlayerInventorySlot);
+        if (lceSlot < 0) {
+            return;
+        }
+        if (sameLceItem(getCachedContainerSlot(containerId, lceSlot), item)) {
+            return;
+        }
+
+        setCachedContainerSlot(containerId, lceSlot, item);
+        ContainerSetSlotPacket slot = new ContainerSetSlotPacket();
+        slot.containerId = containerId;
+        slot.slot = lceSlot;
+        slot.item = copyLceItem(item);
+        sendLce(slot);
+    }
+
     private void sendTileUpdate(int x, int y, int z, int javaBlockState) {
         TileUpdatePacket update = new TileUpdatePacket();
         update.x = x;
@@ -1808,7 +2446,21 @@ public class LceBridgeSession {
             case GENERIC_9X4 -> configureContainer(open, ContainerOpenPacket.CONTAINER, 36);
             case GENERIC_9X5 -> configureContainer(open, ContainerOpenPacket.CONTAINER, 45);
             case GENERIC_9X6, SHULKER_BOX -> configureContainer(open, ContainerOpenPacket.LARGE_CHEST, 54);
-            case CRAFTING, GENERIC_3X3, CRAFTER_3x3 -> configureContainer(open, ContainerOpenPacket.WORKBENCH, 9);
+            case CRAFTING, GENERIC_3X3, CRAFTER_3x3 -> {
+                // Send a generic chest container instead of WORKBENCH to bypass LCE recipe-book UI.
+                // The LCE player places items manually in a 3x3 grid layout within the chest,
+                // and the bridge translates slot numbers bidirectionally.
+                // Layout in the 45-slot chest:
+                //   Row 0 (slots 0-8):   [■][■][■][■][■][■][■][■][■]   all filler
+                //   Row 1 (slots 9-17):  [■][■][1][2][3][■][O][■][■]   grid top + output
+                //   Row 2 (slots 18-26): [■][■][4][5][6][■][■][■][■]   grid middle
+                //   Row 3 (slots 27-35): [■][■][7][8][9][■][■][■][■]   grid bottom
+                //   Row 4 (slots 36-44): [■][■][■][■][■][■][■][■][■]   all filler
+                open.customName = true;
+                open.title = "Crafting Table";
+                craftingContainerIds.add(open.containerId);
+                yield configureContainer(open, ContainerOpenPacket.CONTAINER, 45);
+            }
             case FURNACE, BLAST_FURNACE, SMOKER -> configureContainer(open, ContainerOpenPacket.FURNACE, 3);
             case BREWING_STAND -> configureContainer(open, ContainerOpenPacket.BREWING_STAND, 4);
             case ENCHANTMENT -> configureContainer(open, ContainerOpenPacket.ENCHANTMENT, 9);
@@ -1824,6 +2476,78 @@ public class LceBridgeSession {
         open.type = type;
         open.size = size;
         return open;
+    }
+
+    // ---- Crafting container slot mapping ------------------------------------
+    // Java crafting table layout:
+    //   Slot 0: output, Slots 1-9: 3x3 grid, Slots 10-36: main inv, Slots 37-45: hotbar
+    // LCE fake chest layout (45 slots = 5 rows of 9):
+    //   Row 0: [■][■][■][■][■][■][■][■][■]           all filler
+    //   Row 1: [■][■][g1][g2][g3][■][O][■][■]         grid top (11-13) + output (15)
+    //   Row 2: [■][■][g4][g5][g6][■][■][■][■]         grid mid (20-22)
+    //   Row 3: [■][■][g7][g8][g9][■][■][■][■]         grid bot (29-31)
+    //   Row 4: [■][■][■][■][■][■][■][■][■]           all filler
+    //
+    // Java grid 1->LCE 11, 2->12, 3->13, 4->20, 5->21, 6->22, 7->29, 8->30, 9->31
+    // Java output 0->LCE 15
+
+    /** Map from a Java crafting container slot to the corresponding LCE chest slot. Returns -1 for unmapped. */
+    private int javaCraftSlotToLce(int javaSlot) {
+        return switch (javaSlot) {
+            case 0 -> 15;  // output
+            case 1 -> 11;  // grid row 0
+            case 2 -> 12;
+            case 3 -> 13;
+            case 4 -> 20;  // grid row 1
+            case 5 -> 21;
+            case 6 -> 22;
+            case 7 -> 29;  // grid row 2
+            case 8 -> 30;
+            case 9 -> 31;
+            default -> {
+                // Java slots 10-36 = main inv (3 rows of 9) → LCE 45-71
+                // Java slots 37-45 = hotbar → LCE 72-80
+                if (javaSlot >= 10 && javaSlot <= 45) {
+                    yield (javaSlot - 10) + 45;
+                }
+                yield -1;
+            }
+        };
+    }
+
+    /** Map from a Java player inventory slot (0-35) to the visible LCE slot in the fake crafting chest. */
+    private int javaPlayerInventorySlotToCraftingLce(int javaSlot) {
+        if (javaSlot >= 0 && javaSlot <= 8) {
+            return 72 + javaSlot;
+        }
+        if (javaSlot >= 9 && javaSlot <= 35) {
+            return 45 + (javaSlot - 9);
+        }
+        return -1;
+    }
+
+    /** Map from an LCE chest slot (from a click) to the corresponding Java crafting container slot. Returns -1 for unmapped. */
+    private int lceCraftSlotToJava(int lceSlot) {
+        return switch (lceSlot) {
+            case 15 -> 0;  // output
+            case 11 -> 1;  // grid row 0
+            case 12 -> 2;
+            case 13 -> 3;
+            case 20 -> 4;  // grid row 1
+            case 21 -> 5;
+            case 22 -> 6;
+            case 29 -> 7;  // grid row 2
+            case 30 -> 8;
+            case 31 -> 9;
+            default -> {
+                // LCE 45-71 = main inv → Java 10-36
+                // LCE 72-80 = hotbar → Java 37-45
+                if (lceSlot >= 45 && lceSlot <= 80) {
+                    yield (lceSlot - 45) + 10;
+                }
+                yield -1; // filler slot (0-44 range, not a crafting or inv slot)
+            }
+        };
     }
 
     private void updateLevelIdx(PlayerSpawnInfo info) {
@@ -2362,6 +3086,35 @@ public class LceBridgeSession {
         };
     }
 
+    private int translateJavaPlayerContainerSlotToLce(int javaSlot) {
+        if (javaSlot >= 9 && javaSlot <= 44) {
+            return javaSlot;
+        }
+        return switch (javaSlot) {
+            case 5 -> 5;
+            case 6 -> 6;
+            case 7 -> 7;
+            case 8 -> 8;
+            default -> -1;
+        };
+    }
+
+    private int translateJavaPlayerInventorySlotToContainerSlot(int javaSlot) {
+        if (javaSlot >= 0 && javaSlot <= 8) {
+            return 36 + javaSlot;
+        }
+        if (javaSlot >= 9 && javaSlot <= 35) {
+            return javaSlot;
+        }
+        return switch (javaSlot) {
+            case 36 -> 8;
+            case 37 -> 7;
+            case 38 -> 6;
+            case 39 -> 5;
+            default -> -1;
+        };
+    }
+
     private Integer mapJavaMobType(EntityType type) {
         return switch (type) {
             case CREEPER -> 50;
@@ -2579,6 +3332,7 @@ public class LceBridgeSession {
 
     private void onJavaDisconnected() {
         stopClientTickLoop();
+        pendingInventoryCraft = null;
         spawnFinished.set(false);
         postChunkReady.set(false);
         tileUpdatesReadyAtMs = Long.MAX_VALUE;
@@ -2604,6 +3358,12 @@ public class LceBridgeSession {
         lastChunkNudgeMs = 0L;
         containerStateIds.clear();
         cachedContainerItems.clear();
+        craftingContainerIds.clear();
+        javaPlayerContainerSlots.clear();
+        javaRecipeItemSets.clear();
+        javaInventoryCraftEntries.clear();
+        javaInventoryCraftRecipes.clear();
+        activeCraftingContainerId = 0;
         cachedCursorItem = null;
         blockActionSequence = 0;
         clearActiveDigState();

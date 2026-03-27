@@ -41,12 +41,40 @@ public class ChunkTranslator {
             byte[] rawData = javaChunk.getChunkData();
             ByteBuf buf = Unpooled.wrappedBuffer(rawData);
 
+            // Track whether we've sampled biomes yet (prefer surface-level section at Y=64)
+            boolean biomeSampled = false;
+
             // Sections 0-3 = Y -64 to -1 (below LCE world), 4-19 = Y 0-255, 20-23 = Y 256-319
             for (int si = 0; si < SECTION_COUNT && buf.isReadable(); si++) {
                 ChunkSection section = MinecraftTypes.readChunkSection(buf, 15, 3);
                 if (section == null) continue;
 
                 int baseY = (si - 4) * 16; // LCE Y base (negative for si < 4)
+
+                // Sample biomes from a surface-level section. Java stores biomes at 4×4×4
+                // resolution per section; LCE uses a flat 16×16 byte grid per column.
+                // We sample biome at local y=0 of the chosen section and expand each 4×4
+                // biome cell to fill the 16×16 grid. Prefer section at Y=64 (si=8).
+                // LCE client only has Biome::biomes[] entries for IDs 0-22; anything
+                // outside that range will null-deref crash in the client.
+                if (!biomeSampled && baseY >= 0 && baseY <= 240) {
+                    DataPalette biomes = section.getBiomeData();
+                    if (biomes != null) {
+                        for (int bx = 0; bx < 4; bx++) {
+                            for (int bz = 0; bz < 4; bz++) {
+                                int biomeId = biomes.get(bx, 0, bz);
+                                int lceBiome = (biomeId >= 0 && biomeId <= 22) ? biomeId : 1;
+                                for (int dx = 0; dx < 4; dx++) {
+                                    for (int dz = 0; dz < 4; dz++) {
+                                        builder.setBiome(bx * 4 + dx, bz * 4 + dz, lceBiome);
+                                    }
+                                }
+                            }
+                        }
+                        biomeSampled = true;
+                    }
+                }
+
                 if (baseY < 0 || baseY > 240) continue; // outside LCE 0-255
 
                 DataPalette blocks = section.getBlockData();

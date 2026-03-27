@@ -86,6 +86,21 @@ public class ItemMappings {
         return new LceItemStack(mapped.id, item.getAmount(), mapped.data);
     }
 
+    public String javaName(int protocolItemId) {
+        if (protocolItemId < 0 || protocolItemId >= protocolIdToName.length) {
+            return null;
+        }
+        return protocolIdToName[protocolItemId];
+    }
+
+    public String javaName(LceItemStack item) {
+        Integer protocolId = toJavaProtocolId(item);
+        if (protocolId == null) {
+            return null;
+        }
+        return javaName(protocolId);
+    }
+
     public Integer toJavaProtocolId(LceItemStack item) {
         if (item == null || item.count <= 0) {
             return null;
